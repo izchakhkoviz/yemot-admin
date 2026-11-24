@@ -5,20 +5,100 @@ import os from 'node:os';
 import { spawn } from 'node:child_process';
 import { createHash, scryptSync, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
+import { Firestore } from '@google-cloud/firestore';
 import { MsEdgeTTS, OUTPUT_FORMAT } from 'msedge-tts';
 import { YemotRouter } from 'yemot-router2';
-import { Firestore } from '@google-cloud/firestore';
+
+const FIRESTORE_COLLECTION = process.env.FIRESTORE_COLLECTION || 'yemot_tenants';
+const firestore = new Firestore({ ignoreUndefinedProperties: true });
 
 const RENDER_ORIGIN = 'https://yemot-ai-kg2y.onrender.com';
 const PUBLIC_DEPLOYED_ORIGIN = 'https://bot-yemot-114532963495.europe-west1.run.app';
 const MASTER_REGISTRY_TOKEN = '0772023014:317304103';
-const FALLBACK_GEMINI_KEY = 'AQ.Ab8RN6LFTibbXsxscB9CvtFNeYZFQoKskDXXHl1frDjNC6vKIw';
-const CURRENT_SERVER_VERSION = 'v8';
+const VERTEX_PROJECT_ID = process.env.GOOGLE_CLOUD_PROJECT || '339287195904';
+const FALLBACK_GEMINI_KEY = 'AQ.Ab8RN6JpF4tlvnyWvjGCMY06SBwoP2laKRizrycHjHr6xi6M6A';
+const CURRENT_SERVER_VERSION = 'v12';
+// זיהוי שקט בשלוחה (בלי צורך בסולמית): מינימום שניות דיבור - שניות שקט שמסיימות - מקסימום שניות.
+// אותן הגדרות נכתבות ל-ext.ini וגם מועברות להקלטה, כדי שלא יהיו שתי גרסאות סותרות.
+const VOICE_SILENCE = { minSec: 1, quietSec: 1, maxSec: 20 } as const;
+const VOICE_SILENCE_OPTION = `${VOICE_SILENCE.minSec}-${VOICE_SILENCE.quietSec}-${VOICE_SILENCE.maxSec}`;
+// תווית בנייה לזיהוי הגרסה שרצה (לא משפיעה על לוגיקת הסנכרון)
+const APP_BUILD_LABEL = 'v13-voice-fix';
 let activeTunnelOrigin = '';
 let deployedCloudRunIsV8 = false;
+let geminiKeyInvalidUntil = 0;
+let cachedGcpAccessToken = '';
+let cachedGcpAccessTokenExpiresAt = 0;
+
+let envKeyInvalidUntil = 0;
 
 function getGeminiApiKey(): string {
-  return process.env.GEMINI_API_KEY || FALLBACK_GEMINI_KEY;
+  const envKey = (
+    process.env.GOOGLE_CLOUD_API_KEY ||
+    process.env.GCP_API_KEY ||
+    process.env.GEMINI_API_KEY ||
+    process.env.GOOGLE_API_KEY ||
+    ''
+  ).trim();
+  // מפתח מהסביבה (Render) קודם. המפתח הקשיח נשאר רק כגיבוי זמני ללא סביבה.
+  if (envKey && Date.now() >= envKeyInvalidUntil) return envKey;
+  if (FALLBACK_GEMINI_KEY && Date.now() >= geminiKeyInvalidUntil) {
+    return FALLBACK_GEMINI_KEY;
+  }
+  return envKey || FALLBACK_GEMINI_KEY;
+}
+
+function getGoogleGenAiEndpoint(modelName: string, apiKey: string): string {
+  if (apiKey.startsWith('AQ.')) {
+    return `https://aiplatform.googleapis.com/v1beta1/projects/${VERTEX_PROJECT_ID}/locations/global/publishers/google/models/${modelName}:generateContent?key=${encodeURIComponent(apiKey)}`;
+  }
+  return `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${encodeURIComponent(apiKey)}`;
+}
+
+function getGoogleCloudApiKey(): string {
+  return (
+    process.env.GOOGLE_CLOUD_API_KEY ||
+    process.env.GOOGLE_TTS_API_KEY ||
+    process.env.GOOGLE_API_KEY ||
+    process.env.GCP_API_KEY ||
+    process.env.GEMINI_API_KEY ||
+    ''
+  ).trim();
+}
+
+function markGeminiKeyInvalidIfFallback(keyUsed: string, status: number): void {
+  if (status === 401 || status === 403 || status === 400) {
+    if (keyUsed === FALLBACK_GEMINI_KEY) {
+      geminiKeyInvalidUntil = Date.now() + 5 * 60 * 1000;
+    } else if (keyUsed) {
+      envKeyInvalidUntil = Date.now() + 30 * 60 * 1000;
+    }
+  }
+}
+
+async function getGcpAccessToken(): Promise<string> {
+  if (cachedGcpAccessToken && Date.now() < cachedGcpAccessTokenExpiresAt) {
+    return cachedGcpAccessToken;
+  }
+  try {
+    const r = await fetch(
+      'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token',
+      {
+        headers: { 'Metadata-Flavor': 'Google' },
+        signal: AbortSignal.timeout(700),
+      }
+    );
+    if (!r.ok) return '';
+    const j = (await r.json()) as { access_token?: string; expires_in?: number };
+    if (j.access_token) {
+      cachedGcpAccessToken = j.access_token;
+      cachedGcpAccessTokenExpiresAt = Date.now() + Math.max(30, (j.expires_in || 300) - 30) * 1000;
+      return cachedGcpAccessToken;
+    }
+  } catch {
+    // Not on GCP metadata environment or metadata unavailable
+  }
+  return '';
 }
 
 interface YemotMessage {
@@ -394,31 +474,6 @@ const VOICES: Array<{
     spokenName: 'תמר לאומדיה אישה ישראלית אנושית אנרגטית ומזמינה',
     category: 'studio_female',
   },
-  // קולות קלאסיים בעברית (ממופים לקולות גוגל סטודיו אנושיים)
-  {
-    name: 'he-IL-Wavenet-B',
-    label: 'סטודיו קלאסי B (Iapetus) — גבר ישראלי אנושי עמוק ורשמי',
-    spokenName: 'סטודיו קלאסי בי גבר ישראלי עמוק ורשמי',
-    category: 'classic',
-  },
-  {
-    name: 'he-IL-Wavenet-D',
-    label: 'סטודיו קלאסי D (Charon) — גבר ישראלי אנושי טבעי ושיחתי',
-    spokenName: 'סטודיו קלאסי די גבר ישראלי טבעי ושיחתי',
-    category: 'classic',
-  },
-  {
-    name: 'he-IL-Wavenet-A',
-    label: 'סטודיו קלאסי A (Aoede) — אישה ישראלית אנושית נעימה וברורה',
-    spokenName: 'סטודיו קלאסי איי אישה ישראלית נעימה וברורה',
-    category: 'classic',
-  },
-  {
-    name: 'he-IL-Wavenet-C',
-    label: 'סטודיו קלאסי C (Leda) — אישה ישראלית אנושית רשמית ורהוטה',
-    spokenName: 'סטודיו קלאסי סי אישה ישראלית רשמית ורהוטה',
-    category: 'classic',
-  },
 ];
 
 const DEFAULT_DAYS = Array.from({ length: 7 }, (_, i) => ({
@@ -521,7 +576,10 @@ const extKeyToSlug = (ext?: string): string =>
 
 const ymClean = (t: string) =>
   String(t ?? '')
-    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+    // מסירים גרש/גרשיים בתוך מילים (צה"ל, ד"ר) בלי להפוך אותם לרווח, כדי שלא ייקראו אות-אות
+    .replace(/[\u05F3\u05F4"'`]/g, '')
+    // שומרים פיסוק שהקול קורא טבעית (נקודה, פסיק, שאלה, קריאה, נקודותיים); שאר הסימנים הופכים לרווח
+    .replace(/[^\p{L}\p{N}\s.,?!:;%]/gu, ' ')
     .replace(/\s+/g, ' ')
     .trim() || ' ';
 
@@ -549,7 +607,6 @@ const SEED_TENANTS: Record<string, StoredTenant> = {
     tokenSalt: '635804c3dcd36fa57cf8f8aaa8d4bae6',
     tokenHash: '795725c99f7a6dafa357dfd41443d9e6edaf2978409574b5f38be57f20c89015',
     yemotNumber: '0772023014',
-    yemotPassword: '317304103',
     dailyCallLimit: 200,
     callsToday: 0,
     lastCallDay: '2026-11-18',
@@ -560,7 +617,7 @@ const SEED_TENANTS: Record<string, StoredTenant> = {
     config: mergeConfigWithDefaults({
       role: 'free_chat',
       style: 'warm',
-      voice: { name: 'he-IL-Wavenet-A', speakingRate: 0.8 },
+      voice: { name: 'he-IL-Chirp3-HD-Aoede', speakingRate: 0.8 },
       greeting: 'שלום, אני רובי בוט, במה תרצה שנעסוק היום?',
       yemotChatExt: '1',
       yemotAdminExt: '2',
@@ -575,7 +632,6 @@ const SEED_TENANTS: Record<string, StoredTenant> = {
     tokenSalt: '317b4f54cc7f868bf37d139bd01d631a',
     tokenHash: 'a8f672388b27bb6963c53deea42d826a40a673437ba5c242263f7f15daf5ca33',
     yemotNumber: '0772222672',
-    yemotPassword: '317304103',
     dailyCallLimit: 200,
     callsToday: 0,
     lastCallDay: '2026-11-18',
@@ -586,7 +642,7 @@ const SEED_TENANTS: Record<string, StoredTenant> = {
     config: mergeConfigWithDefaults({
       role: 'free_chat',
       style: 'warm',
-      voice: { name: 'he-IL-Wavenet-A', speakingRate: 1.0 },
+      voice: { name: 'he-IL-Chirp3-HD-Aoede', speakingRate: 1.0 },
       greeting: 'שלום, אני רובי, במה אפשר לעזור?',
       yemotChatExt: '2',
       yemotAdminExt: '3',
@@ -601,7 +657,6 @@ const SEED_TENANTS: Record<string, StoredTenant> = {
     tokenSalt: '08a9dc0767a4a4692cf94380506c82b6',
     tokenHash: '59a7255648ae1521b7552a8336d0ec71a9ae26e6178ed777600e7fbfca672383',
     yemotNumber: '0772610845',
-    yemotPassword: '317304103',
     dailyCallLimit: 200,
     callsToday: 0,
     lastCallDay: '2026-11-18',
@@ -921,76 +976,89 @@ async function updateMasterRegistryIndex(newTenantId?: string): Promise<void> {
   }
 }
 
-// Save tenant record to permanent central cloud vault on MASTER_REGISTRY_TOKEN (via HTTP POST)
-// so Cloud Run cold starts or container restarts NEVER lose any current or future customer's settings,
-// while keeping the customer's own Yemot system completely clean of config files!
-// ===== שמירה קבועה ב-Firestore (Google Cloud) =====
-// הנתונים נשמרים במסד נתונים של גוגל, ולא על הדיסק של השרת, כך שהם לא נמחקים בהפעלה מחדש.
-const FIRESTORE_COLLECTION = process.env.FIRESTORE_COLLECTION || 'yemot_tenants';
-let firestoreClient: Firestore | null = null;
-function getFirestore(): Firestore {
-  if (!firestoreClient) {
-    firestoreClient = new Firestore(
-      process.env.FIRESTORE_DATABASE_ID ? { databaseId: process.env.FIRESTORE_DATABASE_ID } : {}
-    );
-  }
-  return firestoreClient;
-}
+// Save tenant record permanently to Google Cloud Firestore first,
+// keeping the Yemot file upload only as a backup inside its own try/catch that never blocks the save.
+let firestoreUnavailableUntil = 0;
 
-async function firestoreSaveTenant(t: StoredTenant): Promise<void> {
-  await getFirestore()
-    .collection(FIRESTORE_COLLECTION)
-    .doc(t.id)
-    .set({
-      id: t.id,
-      updatedAt: t.updatedAt || new Date().toISOString(),
-      json: JSON.stringify(t),
-    });
-}
-
-async function firestoreGetTenantRaw(tenantId: string): Promise<string | null> {
-  try {
-    const snap = await getFirestore().collection(FIRESTORE_COLLECTION).doc(tenantId).get();
-    return snap.exists ? ((snap.data()?.json as string) || null) : null;
-  } catch (e) {
-    console.error('FIRESTORE READ FAILED:', tenantId, (e as Error)?.message || e);
-    return null;
+function withFirestoreTimeout<T>(fn: () => Promise<T>, ms = 2000): Promise<T> {
+  if (Date.now() < firestoreUnavailableUntil) {
+    return Promise.reject(new Error('Firestore temporarily unavailable (cooldown)'));
   }
-}
-
-async function firestoreLoadAllTenants(): Promise<void> {
-  const snaps = await getFirestore().collection(FIRESTORE_COLLECTION).get();
-  for (const d of snaps.docs) {
-    const raw = d.data()?.json as string | undefined;
-    if (!raw) continue;
-    memoryTenants[d.id] = normalizeTenantStructure(JSON.parse(raw) as StoredTenant);
-  }
-  console.log(`Loaded ${snaps.size} tenants from Firestore`);
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      firestoreUnavailableUntil = Date.now() + 60_000;
+      reject(new Error(`Firestore operation timed out after ${ms}ms`));
+    }, ms);
+    try {
+      const promise = fn();
+      promise.then(
+        (val) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve(val);
+        },
+        (err) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          firestoreUnavailableUntil = Date.now() + 60_000;
+          reject(err);
+        }
+      );
+    } catch (err) {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timer);
+        firestoreUnavailableUntil = Date.now() + 60_000;
+        reject(err);
+      }
+    }
+  });
 }
 
 async function persistTenantToYemotCloud(
   tenant: StoredTenant,
   stampNewTimestamp = true
 ): Promise<void> {
-  try {
-    const stampedUpdatedAt = stampNewTimestamp
-      ? new Date().toISOString()
-      : tenant.updatedAt && tenant.updatedAt > '2026-01-02T00:00:00.000Z'
-      ? tenant.updatedAt
-      : new Date().toISOString();
-    tenant.updatedAt = stampedUpdatedAt;
-    cloudHydratedAt[tenant.id] = Date.now();
-    memoryTenants[tenant.id] = normalizeTenantStructure(tenant);
-    saveLocalTenants(memoryTenants);
+  const stampedUpdatedAt = stampNewTimestamp
+    ? new Date().toISOString()
+    : tenant.updatedAt && tenant.updatedAt > '2026-01-02T00:00:00.000Z'
+    ? tenant.updatedAt
+    : new Date().toISOString();
+  tenant.updatedAt = stampedUpdatedAt;
+  const normalized = normalizeTenantStructure(tenant);
+  cloudHydratedAt[tenant.id] = Date.now();
+  memoryTenants[tenant.id] = normalized;
+  saveLocalTenants(memoryTenants);
 
-    const slim: StoredTenant = {
-      ...tenant,
-      updatedAt: stampedUpdatedAt,
-      memory: {},
-      extensionMemories: {},
-    };
-    await firestoreSaveTenant(slim);
+  try {
+    await withFirestoreTimeout(() =>
+      firestore
+        .collection(FIRESTORE_COLLECTION)
+        .doc(tenant.id)
+        .set({
+          id: tenant.id,
+          updatedAt: stampedUpdatedAt,
+          json: JSON.stringify(normalized),
+        })
+    );
+  } catch (err) {
+    console.error('TENANT SAVE FAILED (Firestore)', err);
+  }
+
+  // Backup upload to Yemot file inside its own try/catch that never blocks the save
+  (async () => {
     try {
+      const slim: StoredTenant = {
+        ...normalized,
+        updatedAt: stampedUpdatedAt,
+        memory: {},
+        extensionMemories: {},
+      };
       await yemotUploadTextFile(
         MASTER_REGISTRY_TOKEN,
         `ivr2:/yemot_ai_t_${tenant.id}.tts`,
@@ -998,11 +1066,9 @@ async function persistTenantToYemotCloud(
       );
       await updateMasterRegistryIndex(tenant.id);
     } catch {
-      // גיבוי בלבד בימות: כשל כאן לא מונע שמירה
+      // ignore backup error
     }
-  } catch (e) {
-    console.error('TENANT SAVE FAILED (Firestore):', tenant.id, (e as Error)?.message || e);
-  }
+  })();
 }
 
 async function hydrateTenantFromYemotCloud(
@@ -1017,11 +1083,45 @@ async function hydrateTenantFromYemotCloud(
   }
   cloudHydratedAt[tenantId] = Date.now();
 
+  // 1. Read from Firestore first
   try {
-    // 1. Check central master registry vault first (stored via POST on MASTER_REGISTRY_TOKEN)
-    const raw =
-      (await firestoreGetTenantRaw(tenantId)) ??
-      (await yemotGetTextFile(MASTER_REGISTRY_TOKEN, `ivr2:/yemot_ai_t_${tenantId}.tts`));
+    const docSnap = await withFirestoreTimeout(() =>
+      firestore.collection(FIRESTORE_COLLECTION).doc(tenantId).get()
+    );
+    if (docSnap.exists) {
+      const data = docSnap.data() as { id?: string; updatedAt?: string; json?: string } | undefined;
+      if (data && typeof data.json === 'string') {
+        const firestoreTenant = normalizeTenantStructure(JSON.parse(data.json) as StoredTenant);
+        const merged = existing
+          ? normalizeTenantStructure({
+              ...existing,
+              ...firestoreTenant,
+              yemotPassword: firestoreTenant.yemotPassword || existing.yemotPassword,
+              updatedAt: data.updatedAt || firestoreTenant.updatedAt || new Date().toISOString(),
+              config: firestoreTenant.config || existing.config,
+              extensions: {
+                ...(existing.extensions || {}),
+                ...(firestoreTenant.extensions || {}),
+              },
+              memory: { ...(existing.memory || {}), ...(firestoreTenant.memory || {}) },
+              extensionMemories: {
+                ...(existing.extensionMemories || {}),
+                ...(firestoreTenant.extensionMemories || {}),
+              },
+            })
+          : firestoreTenant;
+        tenants[tenantId] = merged;
+        saveLocalTenants(tenants);
+        return merged;
+      }
+    }
+  } catch (err) {
+    console.error(`Firestore read failed for tenant ${tenantId}:`, err);
+  }
+
+  // 2. Fall back to the old Yemot file only if the Firestore document does not exist
+  try {
+    const raw = await yemotGetTextFile(MASTER_REGISTRY_TOKEN, `ivr2:/yemot_ai_t_${tenantId}.tts`);
     if (raw) {
       const cloudTenant = normalizeTenantStructure(JSON.parse(raw) as StoredTenant);
       const existingUpdated = existing?.updatedAt || '2026-01-01T00:00:00.000Z';
@@ -1031,6 +1131,7 @@ async function hydrateTenantFromYemotCloud(
           ? normalizeTenantStructure({
               ...existing,
               ...cloudTenant,
+              yemotPassword: cloudTenant.yemotPassword || existing.yemotPassword,
               updatedAt: cloudUpdated,
               config: cloudTenant.config || existing.config,
               extensions: {
@@ -1048,9 +1149,6 @@ async function hydrateTenantFromYemotCloud(
       return normalizeTenantStructure(existing);
     }
 
-    // 2. One-time migration fallback: if this customer doesn't have a v8 master vault entry yet,
-    // check if their Yemot account has legacy yemot_ai_tenant_bundle.tts or yemot_ai_cfg_*.tts files,
-    // import them into the central vault, and clean them from the customer's Yemot root folder.
     if (existing?.yemotNumber && existing?.yemotPassword) {
       const yemotToken = `${existing.yemotNumber}:${existing.yemotPassword}`;
       const bundleRaw = await yemotGetTextFile(yemotToken, 'ivr2:/yemot_ai_tenant_bundle.tts');
@@ -1076,7 +1174,6 @@ async function hydrateTenantFromYemotCloud(
         }
       }
 
-      // Check legacy per-extension config file on customer's Yemot account
       const mainExtSlug = extKeyToSlug(existing.yemotChatExt || '1');
       const legacyCfgRaw =
         (await yemotGetTextFile(yemotToken, `ivr2:/yemot_ai_cfg_${mainExtSlug}.tts`)) ||
@@ -1106,7 +1203,51 @@ async function hydrateTenantFromYemotCloud(
   return existing ? normalizeTenantStructure(existing) : undefined;
 }
 
+async function loadAllTenantsFromFirestore(): Promise<void> {
+  loadLocalTenants();
+  try {
+    const snap = await withFirestoreTimeout(() =>
+      firestore.collection(FIRESTORE_COLLECTION).get()
+    );
+    for (const doc of snap.docs) {
+      const data = doc.data() as { id?: string; updatedAt?: string; json?: string } | undefined;
+      if (data && typeof data.json === 'string') {
+        try {
+          const parsed = normalizeTenantStructure(JSON.parse(data.json) as StoredTenant);
+          const id = data.id || doc.id || parsed.id;
+          if (id) {
+            const cur = memoryTenants[id];
+            memoryTenants[id] = cur
+              ? normalizeTenantStructure({
+                  ...cur,
+                  ...parsed,
+                  yemotPassword: parsed.yemotPassword || cur.yemotPassword,
+                  updatedAt: data.updatedAt || parsed.updatedAt || cur.updatedAt,
+                  config: parsed.config || cur.config,
+                  extensions: { ...(cur.extensions || {}), ...(parsed.extensions || {}) },
+                  memory: { ...(cur.memory || {}), ...(parsed.memory || {}) },
+                  extensionMemories: {
+                    ...(cur.extensionMemories || {}),
+                    ...(parsed.extensionMemories || {}),
+                  },
+                })
+              : parsed;
+            cloudHydratedAt[id] = Date.now();
+            knownRegisteredTenantIds.add(id);
+          }
+        } catch (parseErr) {
+          console.error(`Failed to parse Firestore tenant ${doc.id}:`, parseErr);
+        }
+      }
+    }
+    saveLocalTenants(memoryTenants);
+  } catch (err) {
+    console.error('Failed to load tenants from Firestore on startup:', err);
+  }
+}
+
 async function loadAllTenantsFromCloudRegistry(): Promise<void> {
+  await loadAllTenantsFromFirestore();
   try {
     const rawIdx = await yemotGetTextFile(MASTER_REGISTRY_TOKEN, MASTER_REGISTRY_INDEX_PATH);
     if (rawIdx) {
@@ -1258,7 +1399,8 @@ export async function configureYemotExtensionFull(
   extPath: string,
   apiLinkUrl: string,
   cfg: TenantConfigData,
-  isAdminExt = false
+  isAdminExt = false,
+  prewarmGreeting = true
 ): Promise<{ ok: boolean; error?: string }> {
   const yemotToken = `${yemotNumber}:${yemotPassword}`;
   const cleanExt = extPath.trim().replace(/^\/+|\/+$/g, '');
@@ -1273,7 +1415,7 @@ export async function configureYemotExtensionFull(
         token: yemotToken,
         path: dirPath,
       }).toString()}`,
-      { signal: AbortSignal.timeout(4000) }
+      { signal: AbortSignal.timeout(7500) }
     );
     const dirJson = (await dirRes.json().catch(() => ({}))) as {
       files?: Array<{ name: string }>;
@@ -1302,9 +1444,11 @@ export async function configureYemotExtensionFull(
       }
     }
 
-    await Promise.all(filesToDelete.map((w) => yemotDeleteFile(yemotToken, w)));
-  } catch (e) {
-    console.warn('Directory cleanup warning:', e);
+    if (filesToDelete.length > 0) {
+      await Promise.all(filesToDelete.map((w) => yemotDeleteFile(yemotToken, w)));
+    }
+  } catch {
+    // Best-effort directory cleanup; ignore transient Yemot API timeout
   }
 
   // Also clean any old exposed config files from the customer's Yemot root folder so nothing is exposed in Yemot's web UI
@@ -1326,9 +1470,9 @@ export async function configureYemotExtensionFull(
   ];
 
   if (!isAdminExt) {
-    // Eliminate the recording beep (M1166) and enable automatic silence detection (2s silence ends recording without #)
+    // Eliminate the recording beep (M1166) and enable automatic silence detection (2s silence ends recording without #, min 2s window so caller isn't cut off before starting to speak)
     iniLines.push('api_record_beep=no');
-    iniLines.push('option_record=2-1-15');
+    iniLines.push(`option_record=${VOICE_SILENCE_OPTION}`);
     if (cfg.access?.mode === 'whitelist') {
       iniLines.push('white_list=yes');
       const wlPath = isRoot ? 'ivr2:/WhiteList.ini' : `ivr2:/${cleanExt}/WhiteList.ini`;
@@ -1357,14 +1501,14 @@ export async function configureYemotExtensionFull(
     return mainUpload;
   }
 
-  // 3. Pre-warm and upload greeting audio in the background so call entry is instant and voice is locked
-  if (!isAdminExt) {
+  // 3. Pre-warm and upload greeting audio in the background when saving single extension settings
+  if (!isAdminExt && prewarmGreeting) {
     const greetingText = [cfg.consentMessage, cfg.greeting].filter(Boolean).join(' ');
     if (greetingText) {
       ensureCachedGreetingOnYemot(
         yemotToken,
         greetingText,
-        cfg.voice?.name || 'he-IL-Wavenet-A',
+        cfg.voice?.name || 'he-IL-Chirp3-HD-Charon',
         cfg.voice?.speakingRate ?? 1.0
       ).catch(() => {});
     }
@@ -1492,7 +1636,7 @@ async function authenticateOrCreateLocalTenant(
 
   tenants[tenantId] = created;
   saveLocalTenants(tenants);
-  persistTenantToYemotCloud(created).catch(() => {});
+  await persistTenantToYemotCloud(created);
   return { tenant: created };
 }
 
@@ -1731,9 +1875,9 @@ function getTtsHash(text: string, voiceName: string, speakingRate = 1.0): string
   const prebuilt = mapVoiceToGeminiPrebuilt(voiceName);
   const clampedRate = Math.min(1.35, Math.max(0.75, Number(speakingRate) || 1.0));
   return (
-    'v10_' +
+    'v13_' +
     createHash('sha1')
-      .update(`v10:${prebuilt}:${clampedRate}:${text.trim()}`)
+      .update(`v13:${prebuilt}:${clampedRate}:${text.trim()}`)
       .digest('hex')
       .slice(0, 12)
   );
@@ -1993,7 +2137,7 @@ async function convertMp3ToTelephonyWav(
         '-af',
         afFilter,
         '-ar',
-        '8000',
+        '16000',
         '-ac',
         '1',
         '-c:a',
@@ -2084,6 +2228,7 @@ async function synthesizeEdgeNeuralHebrewTts(
 }
 
 let geminiTtsModelCursor = 0;
+const studioModelCooldownUntil: Record<string, number> = {};
 
 async function applyWavTempoAndTelephonyFormat(
   wavBuf: Buffer,
@@ -2138,20 +2283,23 @@ async function synthesizeGeminiStudioChunk(
   prebuiltVoice: string,
   apiKey: string
 ): Promise<Buffer> {
-  // Load-balance across our 4 genuine Google AI Studio Gemini TTS models (each has its own independent quota bucket
+  // Load-balance across our genuine Google AI Studio / Vertex AI Gemini TTS models (each has its own independent quota bucket
   // and supports the exact same 30 Google AI Studio prebuilt human voices!)
   const allStudioModels = [
     'gemini-3.8-flash-lite-tts',
     'gemini-3.8-flash-tts',
-    'gemini-2.5-flash-preview-tts',
     'gemini-3.1-flash-tts-preview',
   ];
-  const startIdx = geminiTtsModelCursor++ % 2; // alternate primary between 3.8-flash-lite-tts & 3.8-flash-tts
+  const offset = geminiTtsModelCursor++ % allStudioModels.length;
+  const rotated = [
+    ...allStudioModels.slice(offset),
+    ...allStudioModels.slice(0, offset),
+  ];
+  const now = Date.now();
+  // Put non-cooldown models first so we never waste time hitting a temporarily rate-limited model
   const orderedModels = [
-    allStudioModels[startIdx],
-    allStudioModels[1 - startIdx],
-    allStudioModels[2],
-    allStudioModels[3],
+    ...rotated.filter((m) => (studioModelCooldownUntil[m] || 0) <= now),
+    ...rotated.filter((m) => (studioModelCooldownUntil[m] || 0) > now),
   ];
 
   let lastErr: unknown;
@@ -2174,31 +2322,35 @@ async function synthesizeGeminiStudioChunk(
             },
           ];
 
-      const r = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${encodeURIComponent(apiKey)}`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            contents: [{ role: 'user', parts }],
-            generationConfig: {
-              responseModalities: ['AUDIO'],
-              speechConfig: {
-                voiceConfig: {
-                  prebuiltVoiceConfig: {
-                    voiceName: prebuiltVoice,
-                  },
+      const r = await fetch(getGoogleGenAiEndpoint(modelName, apiKey), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ role: 'user', parts }],
+          generationConfig: {
+            responseModalities: ['AUDIO'],
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: {
+                  voiceName: prebuiltVoice,
                 },
               },
             },
-          }),
-          signal: AbortSignal.timeout(7500),
-        }
-      );
+          },
+        }),
+        signal: AbortSignal.timeout(6500),
+      });
 
       if (!r.ok) {
         const errBody = await r.text().catch(() => '');
-        throw new Error(`${modelName} HTTP ${r.status}: ${errBody.slice(0, 120)}`);
+        if (r.status === 401 || (r.status === 400 && errBody.includes('API_KEY_INVALID'))) {
+          markGeminiKeyInvalidIfFallback(apiKey, 401);
+          throw new Error(`Invalid Gemini API key (${r.status})`);
+        }
+        if (r.status === 429 || r.status === 503) {
+          studioModelCooldownUntil[modelName] = Date.now() + 20_000;
+        }
+        throw new Error(`${modelName} HTTP ${r.status}`);
       }
 
       const j = (await r.json()) as {
@@ -2219,9 +2371,10 @@ async function synthesizeGeminiStudioChunk(
       return rawBuf;
     } catch (e) {
       lastErr = e;
+      if (Date.now() < geminiKeyInvalidUntil) break;
     }
   }
-  throw lastErr || new Error('All Google AI Studio TTS models failed');
+  throw lastErr || new Error('All Google AI Studio TTS models busy');
 }
 
 async function synthesizeGeminiStudioTts(
@@ -2250,45 +2403,117 @@ async function synthesizeGeminiStudioTts(
   return { buf: finalWav, mime: 'audio/wav' };
 }
 
+let googleCloudTtsDisabledUntil = 0;
+
+async function synthesizeGoogleCloudTts(
+  cleanText: string,
+  prebuiltVoice = 'Charon',
+  speakingRate = 1.0
+): Promise<{ buf: Buffer; mime: string }> {
+  if (Date.now() < googleCloudTtsDisabledUntil) {
+    throw new Error('Google Cloud TTS temporarily on cooldown');
+  }
+  const apiKey = getGoogleCloudApiKey();
+  const accessToken = apiKey ? '' : await getGcpAccessToken();
+  if (!apiKey && !accessToken) {
+    throw new Error('No Google Cloud API key or GCP Service Account token for Cloud TTS');
+  }
+
+  const profile = NEURAL_VOICE_PROFILES[prebuiltVoice] || NEURAL_VOICE_PROFILES.Charon;
+  const isMale = profile.neuralVoice.includes('Avri');
+  const clampedRate = Math.min(1.35, Math.max(0.75, Number(speakingRate) || 1.0));
+  const candidateVoiceNames = [`he-IL-Chirp3-HD-${prebuiltVoice}`];
+
+  const chunks = splitTextIntoSentenceChunks(cleanText, 480);
+  let lastErr: unknown;
+
+  for (const cloudVoiceName of candidateVoiceNames) {
+    try {
+      const pcmParts: Buffer[] = [];
+      let sampleRate = 16000;
+      const isChirp = cloudVoiceName.includes('Chirp');
+
+      for (const chunk of chunks) {
+        const url = apiKey
+          ? `https://texttospeech.googleapis.com/v1/text:synthesize?key=${encodeURIComponent(apiKey)}`
+          : 'https://texttospeech.googleapis.com/v1/text:synthesize';
+        const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+        if (accessToken) {
+          headers.Authorization = `Bearer ${accessToken}`;
+        }
+
+        const r = await fetch(url, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({
+            input: { text: chunk },
+            voice: {
+              languageCode: 'he-IL',
+              name: cloudVoiceName,
+            },
+            audioConfig: {
+              audioEncoding: 'LINEAR16',
+              sampleRateHertz: 16000,
+              ...(isChirp ? {} : { speakingRate: clampedRate, pitch: (profile.pitchHz || 0) * 0.25 }),
+            },
+          }),
+          signal: AbortSignal.timeout(7000),
+        });
+
+        if (!r.ok) {
+          const errText = await r.text().catch(() => '');
+          if (r.status === 403 && (errText.includes('SERVICE_DISABLED') || errText.includes(' has not been used in project '))) {
+            googleCloudTtsDisabledUntil = Date.now() + 5 * 60 * 1000;
+            throw new Error('Google Cloud Text-to-Speech API is disabled on project');
+          }
+          if (r.status === 401) {
+            googleCloudTtsDisabledUntil = Date.now() + 5 * 60 * 1000;
+          }
+          throw new Error(`Cloud TTS (${cloudVoiceName}) HTTP ${r.status}`);
+        }
+
+        const j = (await r.json()) as { audioContent?: string };
+        if (!j.audioContent) {
+          throw new Error(`Cloud TTS (${cloudVoiceName}) returned empty audioContent`);
+        }
+        const rawWavOrPcm = Buffer.from(j.audioContent, 'base64');
+        const extracted = extractPcmAndRateFromWav(rawWavOrPcm, 16000);
+        sampleRate = extracted.sampleRate;
+        pcmParts.push(extracted.pcm);
+      }
+
+      const combinedWav = wrapPcmToWav(Buffer.concat(pcmParts), sampleRate);
+      return { buf: combinedWav, mime: 'audio/wav' };
+    } catch (e) {
+      lastErr = e;
+      if (Date.now() < googleCloudTtsDisabledUntil) break;
+    }
+  }
+  throw lastErr || new Error('Google Cloud TTS synthesis failed');
+}
+
 async function fetchGoogleTranslateHebrewTts(
   cleanText: string,
   prebuiltVoice = 'Charon',
   speakingRate = 1.0
 ): Promise<{ buf: Buffer; mime: string; isStudioHuman?: boolean }> {
-  // Primary Engine: Genuine Google AI Studio Gemini TTS (30 distinct human voices with breathing, chuckling, humming & natural Hebrew prosody)
-  try {
-    const studioRes = await synthesizeGeminiStudioTts(cleanText, prebuiltVoice, speakingRate);
-    return { ...studioRes, isStudioHuman: true };
-  } catch (studioErr) {
-    console.warn('Google AI Studio TTS warning:', (studioErr as Error)?.message || studioErr);
+  // מנוע יחיד ויציב: Google Cloud Text-to-Speech, קולות Chirp3-HD בלבד (טבעיים).
+  // אין מעבר אוטומטי לקול אחר באמצע שיחה: אותו קול אם מנסים שוב.
+  // מנוע אחד בלבד (Chirp3-HD) לכל השיחות, כדי שהקול יישאר זהה תמיד.
+  // אין מעבר למנוע אחר (כמו Gemini), כי קולות של מנועים שונים נשמעים שונה זה מזה.
+  // במקרה של כשל זמני מנסים שוב על אותו מנוע, עם המתנה קצרה.
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const cloudRes = await synthesizeGoogleCloudTts(cleanText, prebuiltVoice, speakingRate);
+      return { ...cloudRes, isStudioHuman: true };
+    } catch (err) {
+      lastErr = err;
+      console.warn(`Chirp3-HD TTS attempt ${attempt + 1} failed:`, (err as Error)?.message || err);
+      if (attempt < 2) await new Promise((r) => setTimeout(r, 800));
+    }
   }
-
-  // Secondary Fallback: Edge Neural TTS
-  try {
-    const res = await synthesizeEdgeNeuralHebrewTts(cleanText, prebuiltVoice, speakingRate);
-    return { ...res, isStudioHuman: false };
-  } catch (edgeErr) {
-    console.warn('Edge Neural TTS fallback warning:', (edgeErr as Error)?.message || edgeErr);
-  }
-
-  const chunks = splitTextIntoSentenceChunks(cleanText, 185);
-  const bufs = await Promise.all(
-    chunks.map(async (chunk) => {
-      const url =
-        'https://translate.googleapis.com/translate_tts?ie=UTF-8&q=' +
-        encodeURIComponent(chunk) +
-        '&tl=he&client=tw-ob';
-      const r = await fetch(url, { signal: AbortSignal.timeout(4500) });
-      if (!r.ok) {
-        throw new Error(`TTS HTTP ${r.status}`);
-      }
-      return Buffer.from(await r.arrayBuffer());
-    })
-  );
-  const rawMp3 = Buffer.concat(bufs);
-  const profile = NEURAL_VOICE_PROFILES[prebuiltVoice] || NEURAL_VOICE_PROFILES.Aoede;
-  const wavRes = await convertMp3ToTelephonyWav(rawMp3, profile.eq, profile.formantRatio ?? 1.0);
-  return { ...wavRes, isStudioHuman: false };
+  throw lastErr || new Error('Chirp3-HD TTS failed');
 }
 
 async function synthesizeSpeechAudio(
@@ -2303,14 +2528,14 @@ async function synthesizeSpeechAudio(
   const prebuiltVoice = mapVoiceToGeminiPrebuilt(voiceName);
   const clampedRate = Math.min(1.35, Math.max(0.75, Number(speakingRate) || 1.0));
   const hash = getTtsHash(fullText, prebuiltVoice, clampedRate);
-  const cacheKey = `v10:${prebuiltVoice}:${clampedRate}:${fullText}`;
+  const cacheKey = `v13:${prebuiltVoice}:${clampedRate}:${fullText}`;
   const cached = ttsAudioCache.get(cacheKey);
   if (cached) {
     return cached;
   }
 
   // Check persistent disk cache so saved prompts, greetings & voice previews survive server restarts with zero cost
-  const diskPath = TTS_DISK_CACHE_DIR ? path.join(TTS_DISK_CACHE_DIR, `tts10_${hash}.wav`) : null;
+  const diskPath = TTS_DISK_CACHE_DIR ? path.join(TTS_DISK_CACHE_DIR, `tts13_${hash}.wav`) : null;
   if (diskPath && fs.existsSync(diskPath)) {
     try {
       const diskBuf = fs.readFileSync(diskPath);
@@ -2391,7 +2616,7 @@ async function ensureCachedGreetingOnYemot(
   speakingRate = 1.0
 ): Promise<string> {
   const hash = getTtsHash(text, voiceName, speakingRate);
-  const remoteBase = `/ApiAudio/greet_${hash}`;
+  const remoteBase = `/ApiAudio/greet13_${hash}`;
   const sysNum = yemotToken.split(':')[0];
   const cacheKey = `${sysNum}:${remoteBase}`;
   if (uploadedGreetingsOnYemot.has(cacheKey)) {
@@ -2403,8 +2628,8 @@ async function ensureCachedGreetingOnYemot(
   return remoteBase;
 }
 
-// Synthesize telephone admin menu prompts ONCE in the professional studio male voice (Orus / AvriNeural)
-// and save them permanently as a stored recording on Yemot (ivr2:/ApiAudio/adm_v6_<hash>.wav) to save costs and time!
+// Synthesize telephone admin menu prompts ONCE in the professional studio male voice (Orus)
+// and save them permanently as a stored recording on Yemot (ivr2:/ApiAudio/adm13_<hash>.wav) to save costs and time!
 const ADMIN_STUDIO_VOICE = 'he-IL-Chirp3-HD-Orus';
 const ADMIN_STUDIO_RATE = 1.03;
 
@@ -2417,7 +2642,7 @@ async function toCachedAdminMessages(
   if (yemotToken && yemotToken.includes(':')) {
     try {
       const hash = getTtsHash(clean, ADMIN_STUDIO_VOICE, ADMIN_STUDIO_RATE);
-      const remoteBase = `/ApiAudio/adm_${hash}`;
+      const remoteBase = `/ApiAudio/adm13_${hash}`;
       const sysNum = yemotToken.split(':')[0];
       const cacheKey = `${sysNum}:${remoteBase}`;
       if (!uploadedGreetingsOnYemot.has(cacheKey)) {
@@ -2450,26 +2675,30 @@ async function downloadRecordingFromYemot(
           return clean.startsWith('/') ? clean : '/' + clean;
         })
     )
-  );
+  ).slice(0, 3);
 
-  for (let attempt = 0; attempt < 4; attempt++) {
-    for (const cleanPath of uniquePaths) {
-      try {
-        const url =
-          'https://www.call2all.co.il/ym/api/DownloadFile?' +
-          new URLSearchParams({ token: yemotToken, path: 'ivr2:' + cleanPath });
-        const r = await fetch(url, { signal: AbortSignal.timeout(4000) });
-        if (!r.ok) continue;
-        const buf = Buffer.from(await r.arrayBuffer());
-        if (buf.length > 200 && buf[0] !== 0x7b) {
-          return { buf, p: cleanPath };
-        }
-      } catch {
-        // try next path
-      }
+  for (let attempt = 0; attempt < 6; attempt++) {
+    try {
+      const got = await Promise.any(
+        uniquePaths.map(async (cleanPath) => {
+          const url =
+            'https://www.call2all.co.il/ym/api/DownloadFile?' +
+            new URLSearchParams({ token: yemotToken, path: 'ivr2:' + cleanPath });
+          const r = await fetch(url, { signal: AbortSignal.timeout(2500) });
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          const buf = Buffer.from(await r.arrayBuffer());
+          if (buf.length > 200 && buf[0] !== 0x7b) {
+            return { buf, p: cleanPath };
+          }
+          throw new Error('Empty or JSON error buffer');
+        })
+      );
+      if (got) return got;
+    } catch {
+      // Wait briefly if Yemot is still flushing the recording file to disk
     }
-    if (attempt < 3) {
-      await new Promise((r) => setTimeout(r, 180));
+    if (attempt < 5) {
+      await new Promise((r) => setTimeout(r, 110));
     }
   }
   return null;
@@ -2494,90 +2723,99 @@ function cleanTranscriptionText(raw: string): string {
   return t;
 }
 
+let googleCloudSttDisabledUntil = 0;
+
 async function transcribeCallerAudio(
   buf: Buffer | null,
   yemotToken?: string,
   remoteWavPath?: string
 ): Promise<string> {
-  const tasks: Array<Promise<string>> = [];
-
+  // מנוע אחד בכל פעם לפי הסדר (בלי מירוץ בין מנועים, בלי שירות חיצוני איטי).
+  if (!buf || buf.length <= 200) return '';
+  const sttPrompt =
+    'תמלל את הדיבור בהקלטה לעברית מדויקת. החזר אך ורק את המילים שנאמרו, בלי הסברים, בלי מרכאות ובלי חותמות זמן. אם אין דיבור כלל, החזר EMPTY';
   const apiKey = getGeminiApiKey();
-  if (apiKey && buf && buf.length > 200) {
-    const ai = new GoogleGenAI({ apiKey });
-    const base64Audio = buf.toString('base64');
-    const sttPrompt =
-      'חלץ והחזר אך ורק את המילים בעברית שנאמרו בהקלטה (ללא חותמות זמן כמו 00:00 וללא שום הסבר או מרכאות). אם אין דיבור כלל החזר EMPTY';
+  const models = (process.env.STT_MODELS || 'gemini-2.5-flash-lite,gemini-2.5-flash')
+    .split(',')
+    .map((m) => m.trim())
+    .filter(Boolean);
 
-    // Race gemini-3.5-transcribe (~250ms!) and gemini-3.5-flash-lite (~590ms!) in parallel for instant STT!
-    for (const modelName of ['gemini-3.5-transcribe', 'gemini-3.5-flash-lite', 'gemini-3-flash-preview']) {
-      tasks.push(
-        (async () => {
-          const res = await ai.models.generateContent({
-            model: modelName,
+  if (apiKey) {
+    for (const modelName of models) {
+      try {
+        const r = await fetch(getGoogleGenAiEndpoint(modelName, apiKey), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
             contents: [
               {
                 role: 'user',
                 parts: [
-                  { inlineData: { mimeType: 'audio/wav', data: base64Audio } },
+                  { inlineData: { mimeType: 'audio/wav', data: buf.toString('base64') } },
                   { text: sttPrompt },
                 ],
               },
             ],
-            ...(modelName === 'gemini-3-flash-preview'
-              ? { config: { thinkingConfig: { thinkingBudget: 0 } } }
-              : {}),
-          });
-          const part0 = res.candidates?.[0]?.content?.parts?.find(
-            (p) => !p.thought && typeof p.text === 'string'
-          );
-          const candidateText = part0?.text || res.text || '';
-          const cleaned = cleanTranscriptionText(candidateText);
-          if (cleaned) {
-            return cleaned;
-          }
-          if (/^EMPTY\b/i.test(String(candidateText).trim())) {
-            return '';
-          }
-          throw new Error(`Empty transcription from ${modelName}`);
-        })()
-      );
+            generationConfig: { temperature: 0, thinkingConfig: { thinkingBudget: 0 } },
+          }),
+          signal: AbortSignal.timeout(2500),
+        });
+        if (!r.ok) {
+          if (r.status === 401) markGeminiKeyInvalidIfFallback(apiKey, 401);
+          continue;
+        }
+        const j = (await r.json()) as {
+          candidates?: Array<{ content?: { parts?: Array<{ text?: string; thought?: boolean }> } }>;
+        };
+        const part0 = j.candidates?.[0]?.content?.parts?.find(
+          (p) => !p.thought && typeof p.text === 'string'
+        );
+        const cleaned = cleanTranscriptionText(part0?.text || '');
+        console.log(`[STT] ${modelName}: ${cleaned.slice(0, 120)}`);
+        // תשובה של תו בודד או שתיים היא כמעט תמיד רעש. עדיף לבקש מהמתקשר לחזור.
+        if (cleaned.length >= 3) return cleaned;
+      } catch {
+        // נסה את המודל הבא
+      }
     }
   }
 
-  if (yemotToken && remoteWavPath) {
-    tasks.push(
-      (async () => {
-        const cleanWav = remoteWavPath.startsWith('/') ? remoteWavPath : '/' + remoteWavPath;
-        const url =
-          'https://timlul-sq7x.onrender.com/transcribe?' +
-          new URLSearchParams({
-            ApiCallId: 'stt_' + Date.now(),
-            token: yemotToken,
-            M: '/ApiRecords',
-            path: 'ApiRecords',
-            txt: 'no',
-            K1: cleanWav,
-          });
-        const r = await fetch(url, { signal: AbortSignal.timeout(8500) });
-        if (!r.ok) throw new Error(`Timlul HTTP ${r.status}`);
-        const raw = (await r.text()).trim();
-        const m = raw.match(/^read=t-([^.=]+?)\.m-1078/);
-        const extracted = cleanTranscriptionText(m ? m[1] : '');
-        if (extracted) {
-          return extracted;
-        }
-        throw new Error('Timlul returned empty');
-      })()
-    );
-  }
-
-  if (tasks.length === 0) return '';
-
+  // גיבוי: Google Cloud Speech-to-Text (אותו מפתח Google Cloud)
   try {
-    return await Promise.any(tasks);
+    const cloudKey = getGoogleCloudApiKey();
+    const accessToken = cloudKey ? '' : await getGcpAccessToken();
+    if (cloudKey || accessToken) {
+      const url = cloudKey
+        ? `https://speech.googleapis.com/v1/speech:recognize?key=${encodeURIComponent(cloudKey)}`
+        : 'https://speech.googleapis.com/v1/speech:recognize';
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (accessToken) headers.Authorization = `Bearer ${accessToken}`;
+      const r = await fetch(url, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          config: { languageCode: 'he-IL', enableAutomaticPunctuation: true },
+          audio: { content: buf.toString('base64') },
+        }),
+        signal: AbortSignal.timeout(3000),
+      });
+      if (r.ok) {
+        const j = (await r.json()) as {
+          results?: Array<{ alternatives?: Array<{ transcript?: string }> }>;
+        };
+        const transcript = (j.results || [])
+          .map((res) => res.alternatives?.[0]?.transcript || '')
+          .join(' ')
+          .trim();
+        const cleaned = cleanTranscriptionText(transcript);
+        console.log(`[STT] cloud: ${cleaned.slice(0, 120)}`);
+        if (cleaned.length >= 3) return cleaned;
+      }
+    }
   } catch {
-    return '';
+    // אין תמלול
   }
+  return '';
 }
 
 interface AiToolCall {
@@ -2943,7 +3181,7 @@ async function executeMediaOrEmailTool(
   originalUserText: string
 ): Promise<string> {
   const toEmail = String(args.to || '').replace(/\s+/g, '').trim();
-  const voiceName = cfg.voice?.name || 'he-IL-Wavenet-B';
+  const voiceName = cfg.voice?.name || 'he-IL-Chirp3-HD-Iapetus';
 
   try {
     if (toolName === 'send_notification_to_owner') {
@@ -3104,6 +3342,63 @@ async function executeMediaOrEmailTool(
   }
 }
 
+async function callGeminiLlmWithTools(
+  apiKey: string,
+  modelName: string,
+  sysPrompt: string,
+  contents: Array<{ role: string; parts: Array<Record<string, unknown>> }>
+): Promise<{ reply: string; ended: boolean; toolCalls: AiToolCall[] } | null> {
+  const r = await fetch(getGoogleGenAiEndpoint(modelName, apiKey), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      systemInstruction: { role: 'system', parts: [{ text: sysPrompt }] },
+      contents,
+      tools: [{ functionDeclarations: CHAT_TOOL_DECLARATIONS }],
+      generationConfig:
+        modelName === 'gemini-4-hydrogen'
+          ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
+          : { thinkingConfig: { thinkingBudget: 0 } },
+    }),
+    signal: AbortSignal.timeout(4800),
+  });
+  if (!r.ok) {
+    if (r.status === 401) markGeminiKeyInvalidIfFallback(apiKey, 401);
+    throw new Error(`${modelName} HTTP ${r.status}`);
+  }
+  const j = (await r.json()) as {
+    candidates?: Array<{
+      content?: {
+        parts?: Array<{
+          text?: string;
+          thought?: boolean;
+          functionCall?: { name?: string; args?: Record<string, unknown> };
+        }>;
+      };
+    }>;
+  };
+  const parts = j.candidates?.[0]?.content?.parts || [];
+  const fcs = parts
+    .map((p) => p.functionCall)
+    .filter((fc): fc is { name?: string; args?: Record<string, unknown> } => Boolean(fc));
+  const ended = Boolean(fcs.some((fc) => fc.name === 'end_call'));
+  const toolCalls: AiToolCall[] = fcs
+    .filter((fc) => fc.name && fc.name !== 'end_call')
+    .map((fc) => ({
+      name: String(fc.name),
+      args: (fc.args as Record<string, unknown>) || {},
+    }));
+  const reply = parts
+    .filter((p) => !p.thought && typeof p.text === 'string')
+    .map((p) => p.text)
+    .join(' ')
+    .trim();
+  if (reply || ended || toolCalls.length > 0) {
+    return { reply, ended, toolCalls };
+  }
+  return null;
+}
+
 async function generateDirectAudioAiReply(
   cfg: TenantConfigData,
   history: Array<{ role: string; parts: Array<Record<string, unknown>> }>,
@@ -3116,8 +3411,7 @@ async function generateDirectAudioAiReply(
 
   try {
     const sysPrompt = buildSystemPrompt(cfg, callerPhone, callerEmail);
-    const ai = new GoogleGenAI({ apiKey });
-    const recentHistory = history.slice(-30);
+    const recentHistory = history.slice(-18);
     const contents = [
       ...recentHistory,
       {
@@ -3136,34 +3430,18 @@ async function generateDirectAudioAiReply(
       },
     ];
 
-    for (const modelName of ['gemini-3.5-flash-lite', 'gemini-3-flash-preview', 'gemini-3.1-flash-lite']) {
+    for (const modelName of ['gemini-3.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-3-flash-preview']) {
       try {
-        const res = await ai.models.generateContent({
-          model: modelName,
-          contents: contents as never,
-          config: {
-            systemInstruction: sysPrompt,
-            tools: [{ functionDeclarations: CHAT_TOOL_DECLARATIONS as never }],
-            ...(modelName === 'gemini-3-flash-preview' || modelName === 'gemini-3.1-flash-lite'
-              ? { thinkingConfig: { thinkingBudget: 0 } }
-              : {}),
-          },
-        });
-
-        const fcs = res.functionCalls || [];
-        const ended = Boolean(fcs.some((fc) => fc.name === 'end_call'));
-        const toolCalls: AiToolCall[] = fcs
-          .filter((fc) => fc.name && fc.name !== 'end_call')
-          .map((fc) => ({
-            name: String(fc.name),
-            args: (fc.args as Record<string, unknown>) || {},
-          }));
-        const reply = (res.text || '').trim();
-        if (reply || ended || toolCalls.length > 0) {
-          return { reply: reply || (ended ? cfg.goodbye : ''), ended, toolCalls };
+        const out = await callGeminiLlmWithTools(apiKey, modelName, sysPrompt, contents);
+        if (out) {
+          return {
+            reply: out.reply || (out.ended ? cfg.goodbye : ''),
+            ended: out.ended,
+            toolCalls: out.toolCalls,
+          };
         }
       } catch {
-        // try next fast model
+        if (Date.now() < geminiKeyInvalidUntil) break;
       }
     }
   } catch {
@@ -3181,45 +3459,27 @@ async function generateAiReply(
   const sysPrompt = buildSystemPrompt(cfg, callerPhone, callerEmail);
   const apiKey = getGeminiApiKey();
 
-  // Pass up to 36 recent messages of conversation memory for ultra-fast response latency (< 1.2s)
-  const recentHistory = history.slice(-36);
+  // Pass recent messages of conversation memory for ultra-fast response latency (< 0.7s)
+  const recentHistory = history.slice(-18);
 
   if (apiKey) {
-    const ai = new GoogleGenAI({ apiKey });
     for (const modelName of [
       'gemini-3.5-flash-lite',
-      'gemini-3-flash-preview',
       'gemini-3.1-flash-lite',
+      'gemini-3-flash-preview',
       'gemini-4-hydrogen',
     ]) {
       try {
-        const res = await ai.models.generateContent({
-          model: modelName,
-          contents: recentHistory as never,
-          config: {
-            systemInstruction: sysPrompt,
-            tools: [{ functionDeclarations: CHAT_TOOL_DECLARATIONS as never }],
-            ...(modelName === 'gemini-3-flash-preview' || modelName === 'gemini-3.1-flash-lite'
-              ? { thinkingConfig: { thinkingBudget: 0 } }
-              : modelName === 'gemini-4-hydrogen'
-              ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
-              : {}),
-          },
-        });
-        const fcs = res.functionCalls || [];
-        const ended = Boolean(fcs.some((fc) => fc.name === 'end_call'));
-        const toolCalls: AiToolCall[] = fcs
-          .filter((fc) => fc.name && fc.name !== 'end_call')
-          .map((fc) => ({
-            name: String(fc.name),
-            args: (fc.args as Record<string, unknown>) || {},
-          }));
-        const reply = (res.text || '').trim();
-        if (reply || ended || toolCalls.length > 0) {
-          return { reply: reply || (ended ? cfg.goodbye : ''), ended, toolCalls };
+        const out = await callGeminiLlmWithTools(apiKey, modelName, sysPrompt, recentHistory);
+        if (out) {
+          return {
+            reply: out.reply || (out.ended ? cfg.goodbye : ''),
+            ended: out.ended,
+            toolCalls: out.toolCalls,
+          };
         }
-      } catch (e) {
-        console.warn(`[LLM ${modelName}] failed:`, (e as Error)?.message || e);
+      } catch {
+        if (Date.now() < geminiKeyInvalidUntil) break;
       }
     }
   }
@@ -3228,7 +3488,7 @@ async function generateAiReply(
     const messages: Array<{ role: string; content: string }> = [
       { role: 'system', content: sysPrompt },
     ];
-    for (const h of recentHistory.slice(-30)) {
+    for (const h of recentHistory.slice(-14)) {
       const textPart = (h.parts || [])
         .map((p) => (typeof p.text === 'string' ? p.text : ''))
         .filter(Boolean)
@@ -3247,7 +3507,7 @@ async function generateAiReply(
         model: 'openai',
         messages,
       }),
-      signal: AbortSignal.timeout(4500),
+      signal: AbortSignal.timeout(3500),
     });
     if (r.ok) {
       const j = (await r.json()) as {
@@ -3454,7 +3714,7 @@ async function toYemotMessages(
   if (tenant.yemotNumber && tenant.yemotPassword) {
     try {
       const yemotToken = `${tenant.yemotNumber}:${tenant.yemotPassword}`;
-      const voiceName = cfg.voice?.name || 'he-IL-Wavenet-B';
+      const voiceName = cfg.voice?.name || 'he-IL-Chirp3-HD-Iapetus';
       const speakingRate = cfg.voice?.speakingRate ?? 1.0;
 
       if (isStaticGreeting) {
@@ -3626,6 +3886,8 @@ async function recordAndTranscribeAdminInput(
 }
 
 async function startServer() {
+  await loadAllTenantsFromFirestore();
+
   const app = express();
   const isPreviewEnv =
     Boolean(process.env.K_SERVICE?.startsWith('ais-dev-')) ||
@@ -3728,11 +3990,11 @@ async function startServer() {
       let prompt = initialPrompt;
 
       const isHandsFree = cfg.handsFreeMode !== false;
-      // With option_record=2-1-15 in ext.ini, Yemot automatically stops recording after 2s of silence without needing #.
+      // ה-ext.ini וההקלטה משתמשים באותו זיהוי שקט (VOICE_SILENCE): מסתיים אחרי שקט בלי סולמית.
       // Setting recordMaxSec to a responsive window (default 15s when hands-free is on, or user-configured 4-25s) ensures natural speech flow.
       const configuredStopSec = Number(cfg.handsFreeAutoStopSec) || 4;
       const recordMaxSec = isHandsFree
-        ? Math.min(25, Math.max(4, configuredStopSec <= 4 ? 14 : configuredStopSec))
+        ? Math.min(VOICE_SILENCE.maxSec, Math.max(15, configuredStopSec))
         : 40;
       const maxSilentTurns = isHandsFree ? 6 : 3;
 
@@ -3744,8 +4006,8 @@ async function startServer() {
           no_confirm_menu: true,
           save_on_hangup: true,
           max_length: recordMaxSec,
-          min_length: 1,
-          quiet_max: 2,
+          min_length: VOICE_SILENCE.minSec,
+          quiet_max: VOICE_SILENCE.quietSec,
         });
 
         if (typeof rec === 'string' && rec.toLowerCase().includes('hangup')) {
@@ -3762,13 +4024,12 @@ async function startServer() {
               : '';
           const candidatePaths = [
             `/ApiRecords/${fname}.wav`,
-            rawRec ? (rawRec.startsWith('/') ? rawRec : `/${rawRec}`) : '',
-            rawRec && !rawRec.endsWith('.wav')
-              ? (rawRec.startsWith('/') ? rawRec : `/${rawRec}`) + '.wav'
-              : '',
-            rawRec && !rawRec.includes('/') ? `/ApiRecords/${rawRec}` : '',
-            rawRec && !rawRec.includes('/') && !rawRec.endsWith('.wav')
-              ? `/ApiRecords/${rawRec}.wav`
+            rawRec
+              ? rawRec.startsWith('/')
+                ? rawRec.endsWith('.wav')
+                  ? rawRec
+                  : `${rawRec}.wav`
+                : `/ApiRecords/${rawRec.endsWith('.wav') ? rawRec : `${rawRec}.wav`}`
               : '',
             call.extension ? `/${call.extension.replace(/^\/+/, '')}/ApiRecords/${fname}.wav` : '',
           ].filter(Boolean);
@@ -3798,6 +4059,10 @@ async function startServer() {
           } else {
             yemotDeleteFile(yemotToken, `ivr2:/ApiRecords/${fname}.wav`).catch(() => {});
           }
+        }
+
+        if (!text && directAiOut && (directAiOut.reply || directAiOut.toolCalls.length > 0)) {
+          text = '(הודעה קולית)';
         }
 
         if (!text) {
@@ -4061,7 +4326,7 @@ async function startServer() {
       }
       tenants[tenant.id] = tenant;
       saveLocalTenants(tenants);
-      persistTenantToYemotCloud(tenant).catch(() => {});
+      await persistTenantToYemotCloud(tenant);
 
       const extPath = activeExtKey === 'root' ? 'root' : activeExtKey;
       const publicOrigin = getPublicOrigin(call.req);
@@ -4072,7 +4337,7 @@ async function startServer() {
         ensureCachedGreetingOnYemot(
           yemotToken,
           greetingText,
-          updated.voice?.name || 'he-IL-Wavenet-A',
+          updated.voice?.name || 'he-IL-Chirp3-HD-Aoede',
           updated.voice?.speakingRate ?? 1.0
         ).catch(() => {});
       }
@@ -4088,24 +4353,161 @@ async function startServer() {
       await notice(announcement);
     };
 
+    const askEmailOrVoice = async (labelHe: string): Promise<string> => {
+      const method = await ask(
+        `לעדכון ${labelHe} באמצעות הקלדת אותיות במקלדת הטלפון הקישו 1. לעדכון באמצעות אמירת הכתובת בקול הקישו 2. לניקוי הכתובת הקישו 3. לביטול הקישו 9`
+      );
+      if (method === '1') {
+        const typed = await call.read(
+          await toCachedAdminMessages(
+            yemotToken,
+            `הקלידו את ${labelHe} במקלדת הטלפון ובסיום סולמית`
+          ),
+          'tap',
+          {
+            max_digits: 60,
+            min_digits: 3,
+            sec_wait: 14,
+            typing_playback_mode: 'EmailKeyboard',
+          }
+        );
+        const clean = String(typed || '').trim().toLowerCase();
+        return clean.includes('@') ? clean : '';
+      }
+      if (method === '2') {
+        const spoken = await recordAndTranscribeAdminInput(
+          call,
+          yemotToken,
+          `אמרו את ${labelHe} באנגלית או באיות ברור.`,
+          callId,
+          ++stepIdx
+        );
+        const clean = String(spoken || '')
+          .replace(/שטרודל|כרוכית|\bat\b/gi, '@')
+          .replace(/נקודה|\bdot\b/gi, '.')
+          .replace(/\s+/g, '')
+          .toLowerCase();
+        return clean.includes('@') ? clean : '';
+      }
+      if (method === '3') {
+        return '__CLEAR__';
+      }
+      return '';
+    };
+
+    const previewAndConfirmVoice = async (
+      picked: (typeof VOICES)[number],
+      pool: typeof VOICES,
+      currentIndex: number
+    ): Promise<'saved' | 'next' | 'back'> => {
+      const defaultSampleSentence =
+        'שלום וברכה! כך הקול שלי נשמע בשיחת הטלפון במערכת ימות איי איי. אם הקול הזה נעים ומתאים לכם, אשמח לענות למתקשרים שלכם בקול הזה.';
+      let sampleSentence = defaultSampleSentence;
+      const rate = getTenantExtConfig(tenant, activeExtKey)?.voice?.speakingRate ?? 1.0;
+
+      let keepPreviewingThisVoice = true;
+      while (keepPreviewingThisVoice) {
+        let previewPath = '';
+        try {
+          const sampleHash = getTtsHash(sampleSentence, picked.name, rate);
+          previewPath = `/ApiAudio/prev12_${sampleHash}`;
+          const sysNum = yemotToken.split(':')[0];
+          const prevKey = `${sysNum}:${previewPath}`;
+          if (!uploadedGreetingsOnYemot.has(prevKey)) {
+            const sampleAudio = await synthesizeSpeechAudio(sampleSentence, picked.name, rate);
+            await uploadAudioToYemot(
+              yemotToken,
+              sampleAudio.buf,
+              sampleAudio.mime,
+              `${previewPath}.wav`
+            );
+            markFileUploadedOnYemot(prevKey);
+          }
+        } catch (e) {
+          console.warn('Voice preview upload warning:', (e as Error)?.message || e);
+          previewPath = '';
+        }
+
+        const nextVoiceObj = pool[(currentIndex + 1) % pool.length];
+        const confirmInstructionMsgs = await toCachedAdminMessages(
+          yemotToken,
+          previewPath
+            ? `שמעתם כעת דוגמה של הקול ${picked.spokenName}. ` +
+                'לאישור ושמירת הקול הזה הקישו 1. ' +
+                'לשמיעת המשפט לדוגמה פעם נוספת הקישו 2. ' +
+                'להקלטת משפט משלכם כדי לשמוע איך הקול הזה מבטא אותו לפני האישור הקישו 3. ' +
+                (nextVoiceObj
+                  ? `למעבר מיידי לשמיעת הקול הבא ברשימה, ${nextVoiceObj.spokenName}, הקישו 4. `
+                  : '') +
+                'לחזרה לרשימת הקולות הקישו 9'
+            : `נבחר הקול ${picked.spokenName}. לאישור ושמירת הקול הזה הקישו 1. להקלטת משפט בדיקה משלכם הקישו 3. למעבר לקול הבא הקישו 4. לחזרה הקישו 9`
+        );
+        const confirmPrompt: YemotMessage[] = previewPath
+          ? [{ type: 'file', data: previewPath }, ...confirmInstructionMsgs]
+          : confirmInstructionMsgs;
+
+        const confirmTap = await call.read(confirmPrompt, 'tap', {
+          max_digits: 1,
+          min_digits: 1,
+          sec_wait: 10,
+        });
+
+        if (confirmTap === '1') {
+          const cfgNow = getTenantExtConfig(tenant, activeExtKey);
+          cfgNow.voice = {
+            provider: 'google',
+            name: picked.name,
+            speakingRate: rate,
+          };
+          await saveAndSyncExt(
+            cfgNow,
+            `הקול אושר ועודכן בהצלחה ל${picked.spokenName} ויישמר קבוע בכל השיחות`,
+            true
+          );
+          return 'saved';
+        } else if (confirmTap === '2') {
+          continue;
+        } else if (confirmTap === '3') {
+          const customText = await recordAndTranscribeAdminInput(
+            call,
+            yemotToken,
+            `אמרו כעת כל משפט שתרצו לשמוע בקול ${picked.spokenName}.`,
+            callId,
+            ++stepIdx
+          );
+          if (customText) {
+            sampleSentence = customText;
+          }
+          continue;
+        } else if (confirmTap === '4') {
+          return 'next';
+        } else {
+          return 'back';
+        }
+      }
+      return 'back';
+    };
+
     while (true) {
       const cfg = getTenantExtConfig(tenant, activeExtKey);
       const roleLabel = PRESETS[cfg.role]?.label || cfg.role;
       const extDisplay = activeExtKey === 'root' ? 'הראשית' : activeExtKey;
+      const currentVoiceObj =
+        VOICES.find((v) => v.name === cfg.voice?.name) || VOICES[0];
 
       const mainChoice = await ask(
-        `ניהול שלוחה ${extDisplay}, תפקיד ${roleLabel}, השירות ${
+        `ניהול שלוחה ${extDisplay}, תפקיד ${roleLabel}, קול ${currentVoiceObj.spokenName}, השירות ${
           cfg.enabled ? 'פעיל' : 'כבוי'
         }. ` +
-          'להפעלה או כיבוי הקישו 1. ' +
-          'לבחירת תפקיד והגדרות ייחודיות לתפקיד הקישו 2. ' +
-          'לבחירת קול מהירות וניקוד הקישו 3. ' +
+          'להפעלה או כיבוי ושמיעת סיכום מצב השלוחה הקישו 1. ' +
+          'לבחירת תפקיד, פרטי העסק, אימייל התראות והגדרות ייחודיות לתפקיד הקישו 2. ' +
+          'לאולפן הקולות, שמיעת כל קול לפני אישור, מהירות דיבור וניקוד הקישו 3. ' +
           'לסגנון דיבור הקישו 4. ' +
-          'להקלטת הודעות פתיחה סיום וסגירה הקישו 5. ' +
+          'להקלטת ושמיעת הודעות פתיחה, סיום, הסכמה, סגירה וחסימה הקישו 5. ' +
           'להגבלת נושאי שיחה הקישו 6. ' +
           'לבקרת גישה ורשימה לבנה או שחורה הקישו 7. ' +
-          'לשעות פעילות אורך שיחה וכלים הקישו 8. ' +
-          'לזיכרון שיחות מעבר בין שלוחות או הוספת שלוחה הקישו 9. ' +
+          'ללוח שעות פעילות שבועי, אורך שיחה, מצב שיחה טבעית וכלים חכמים הקישו 8. ' +
+          'לניהול שלוחות מרובות, זיכרון שיחות ומכסה יומית הקישו 9. ' +
           'ליציאה הקישו 0'
       );
 
@@ -4114,14 +4516,35 @@ async function startServer() {
         return call.hangup();
       }
 
-      // 1. Toggle active status
+      // 1. Toggle active status or hear full extension status summary
       if (mainChoice === '1') {
-        cfg.enabled = !cfg.enabled;
-        await saveAndSyncExt(cfg, cfg.enabled ? 'השירות בשלוחה הופעל' : 'השירות בשלוחה כובה');
+        const sub1 = await ask(
+          `השירות בשלוחה ${extDisplay} כעת ${cfg.enabled ? 'פעיל' : 'כבוי'}. ` +
+            `ל${cfg.enabled ? 'כיבוי' : 'הפעלת'} השירות הקישו 1. ` +
+            'לשמיעת סיכום מלא של כל הגדרות השלוחה הנוכחיות הקישו 2. ' +
+            'לחזרה הקישו 9'
+        );
+        if (sub1 === '1') {
+          cfg.enabled = !cfg.enabled;
+          await saveAndSyncExt(cfg, cfg.enabled ? 'השירות בשלוחה הופעל' : 'השירות בשלוחה כובה');
+        } else if (sub1 === '2') {
+          const styleLabel = STYLE_NAMES_HE[cfg.style] || cfg.style;
+          const ratePct = Math.round((cfg.voice?.speakingRate ?? 1.0) * 100);
+          await notice(
+            `סיכום הגדרות שלוחה ${extDisplay}: ` +
+              `השירות ${cfg.enabled ? 'פעיל' : 'כבוי'}. ` +
+              `תפקיד הבוט: ${roleLabel}. ` +
+              `שם העסק: ${cfg.businessName || 'לא הוגדר'}. ` +
+              `הקול הנבחר: ${currentVoiceObj.spokenName}, במהירות ${ratePct} אחוז, ניקוד אוטומטי ${cfg.useNikud ? 'פעיל' : 'כבוי'}. ` +
+              `סגנון הדיבור: ${styleLabel}. ` +
+              `אורך שיחה מקסימלי: ${cfg.maxMinutes || 10} דקות. ` +
+              `הגבלת שעות פעילות: ${cfg.schedule?.enabled ? 'פעילה' : 'כבויה'}.`
+          );
+        }
         continue;
       }
 
-      // 2. Role selection, business info, and role-specific parameters
+      // 2. Role selection, business info, notification email, and role-specific parameters
       if (mainChoice === '2') {
         const sub2 = await ask(
           `התפקיד הנוכחי הוא ${roleLabel}. ` +
@@ -4130,6 +4553,8 @@ async function startServer() {
             'לעדכון שם העסק הקישו 3. ' +
             'לעדכון מידע כללי על העסק הקישו 4. ' +
             'לעדכון הוראות מיוחדות לבוט הקישו 5. ' +
+            'לעדכון כתובת אימייל לקבלת סיכומי שיחות ופניות הקישו 6. ' +
+            'לשמיעת כל פרטי העסק והתפקיד המוגדרים כעת הקישו 7. ' +
             'לחזרה הקישו 9'
         );
 
@@ -4155,7 +4580,9 @@ async function startServer() {
                 'לעדכון סטטוס זמינות המנהל הקישו 3. ' +
                 'לעדכון הפרטים שחובה לקחת מכל מתקשר הקישו 4. ' +
                 'לעדכון תשובות לשאלות נפוצות הקישו 5. ' +
-                'לעדכון נוהל מקרים דחופים הקישו 6. לחזרה הקישו 9'
+                'לעדכון נוהל מקרים דחופים הקישו 6. ' +
+                `ל${recParams.sendSummaryNote !== false ? 'כיבוי' : 'הפעלת'} שליחת סיכום פנייה אוטומטי למייל בסיום שיחה הקישו 7. ` +
+                'לשמיעת הגדרות המזכיר הנוכחיות הקישו 8. לחזרה הקישו 9'
             );
             if (rSub === '1') {
               const t = await recordAndTranscribeAdminInput(
@@ -4229,6 +4656,18 @@ async function startServer() {
                 recParams.urgentPolicy = t;
                 await saveAndSyncExt(cfg, 'נוהל מקרים דחופים עודכן');
               }
+            } else if (rSub === '7') {
+              recParams.sendSummaryNote = recParams.sendSummaryNote === false;
+              await saveAndSyncExt(
+                cfg,
+                recParams.sendSummaryNote
+                  ? 'שליחת סיכום פנייה אוטומטי למייל הופעלה'
+                  : 'שליחת סיכום פנייה אוטומטי למייל כובתה'
+              );
+            } else if (rSub === '8') {
+              await notice(
+                `הגדרות מזכיר אישי: שם המנהל ${recParams.ownerName || 'לא הוגדר'}, תואר ${recParams.ownerTitle || 'לא הוגדר'}, זמינות ${recParams.availabilityStatus || 'לא הוגדר'}, פרטי חובה ${recParams.collectFields || 'לא הוגדר'}.`
+              );
             }
           } else if (cfg.role === 'sales') {
             const sParams = cfg.roleParams.sales;
@@ -4239,7 +4678,8 @@ async function startServer() {
                 'לעדכון מבצע או הטבה נוכחית הקישו 3. ' +
                 'לעדכון מענה להתנגדויות לקוח הקישו 4. ' +
                 'לעדכון יעד הסגירה של השיחה הקישו 5. ' +
-                'לבחירת רמת אסרטיביות ורטוריקת שכנוע הקישו 6. לחזרה הקישו 9'
+                'לבחירת רמת אסרטיביות ורטוריקת שכנוע הקישו 6. ' +
+                'לשמיעת הגדרות המכירות הנוכחיות הקישו 8. לחזרה הקישו 9'
             );
             if (sSub === '1') {
               const t = await recordAndTranscribeAdminInput(
@@ -4309,6 +4749,10 @@ async function startServer() {
               if (pStyle === '2') sParams.persuasionStyle = 'charismatic';
               if (pStyle === '3') sParams.persuasionStyle = 'closer';
               await saveAndSyncExt(cfg, 'רטוריקת המכירה עודכנה');
+            } else if (sSub === '8') {
+              await notice(
+                `הגדרות נציג מכירות: קטלוג ${sParams.productsCatalog || 'לא הוגדר'}, מבצע ${sParams.currentPromo || 'לא הוגדר'}, יעד סגירה ${sParams.closingGoal || 'לא הוגדר'}.`
+              );
             }
           } else if (cfg.role === 'customer_service') {
             const csParams = cfg.roleParams.customer_service;
@@ -4319,7 +4763,8 @@ async function startServer() {
                 'לעדכון מדיניות החזרות ואחריות הקישו 3. ' +
                 'לעדכון נוהל העברה לנציג בכיר הקישו 4. ' +
                 'לעדכון זמן מענה מובטח הקישו 5. ' +
-                'לבחירת רמת אמפתיה הקישו 6. לחזרה הקישו 9'
+                'לבחירת רמת אמפתיה הקישו 6. ' +
+                'לשמיעת הגדרות שירות הלקוחות הנוכחיות הקישו 8. לחזרה הקישו 9'
             );
             if (csSub === '1') {
               const t = await recordAndTranscribeAdminInput(
@@ -4389,6 +4834,10 @@ async function startServer() {
               if (emp === '2') csParams.empathyLevel = 'practical';
               if (emp === '3') csParams.empathyLevel = 'vip';
               await saveAndSyncExt(cfg, 'גישת השירות עודכנה');
+            } else if (csSub === '8') {
+              await notice(
+                `הגדרות שירות לקוחות: שירותים נתמכים ${csParams.supportedServices || 'לא הוגדר'}, אחריות ${csParams.refundWarrantyPolicy || 'לא הוגדר'}, זמן מענה ${csParams.slaPromise || 'לא הוגדר'}.`
+              );
             }
           } else {
             // free_chat
@@ -4399,7 +4848,8 @@ async function startServer() {
                 'לעדכון אופי ורקע הדמות הקישו 2. ' +
                 'לעדכון נושאים מועדפים לשיחה הקישו 3. ' +
                 'לבחירת רמת סינון תוכן ושפה הקישו 4. ' +
-                'לבחירת אופן הובלת השיחה הקישו 5. לחזרה הקישו 9'
+                'לבחירת אופן הובלת השיחה הקישו 5. ' +
+                'לשמיעת הגדרות השיחה החופשית הנוכחיות הקישו 8. לחזרה הקישו 9'
             );
             if (fcSub === '1') {
               const t = await recordAndTranscribeAdminInput(
@@ -4454,6 +4904,10 @@ async function startServer() {
               if (cm === '3') fcParams.conversationMode = 'storyteller';
               if (cm === '4') fcParams.conversationMode = 'intellectual_debate';
               await saveAndSyncExt(cfg, 'אופן הובלת השיחה עודכן');
+            } else if (fcSub === '8') {
+              await notice(
+                `הגדרות שיחה חופשית: שם הדמות ${fcParams.botPersonaName || 'לא הוגדר'}, רקע ${fcParams.personaBackground || 'לא הוגדר'}, נושאים מועדפים ${fcParams.favoriteTopics || 'לא הוגדר'}.`
+              );
             }
           }
         } else if (sub2 === '3') {
@@ -4492,30 +4946,50 @@ async function startServer() {
             cfg.customInstructions = t;
             await saveAndSyncExt(cfg, 'ההוראות המיוחדות עודכנו');
           }
+        } else if (sub2 === '6') {
+          const em = await askEmailOrVoice('כתובת האימייל לקבלת סיכומי שיחות ופניות');
+          if (em === '__CLEAR__') {
+            cfg.notificationEmail = '';
+            await saveAndSyncExt(cfg, 'כתובת האימייל להתראות הוסרה');
+          } else if (em) {
+            cfg.notificationEmail = em;
+            await saveAndSyncExt(cfg, `כתובת האימייל להתראות עודכנה ל ${em}`);
+          } else {
+            await notice('לא נקלטה כתובת אימייל תקינה');
+          }
+        } else if (sub2 === '7') {
+          await notice(
+            `תפקיד הבוט: ${roleLabel}. ` +
+              `שם העסק: ${cfg.businessName || 'לא הוגדר'}. ` +
+              `מידע על העסק: ${cfg.businessInfo || 'לא הוגדר'}. ` +
+              `הוראות מיוחדות: ${cfg.customInstructions || 'לא הוגדרו'}. ` +
+              `אימייל להתראות: ${cfg.notificationEmail || 'לא הוגדר'}.`
+          );
         }
         continue;
       }
 
-      // 3. Voice (with live voice sample preview before confirmation!), speaking rate, and Nikud
+      // 3. Voice Studio (live sample preview of every voice, custom test sentence, sequential auditioning, speaking rate, and Nikud)
       if (mainChoice === '3') {
-        const currentVoiceObj =
-          VOICES.find((v) => v.name === cfg.voice?.name) || VOICES[0];
+        const ratePct = Math.round((cfg.voice?.speakingRate ?? 1.0) * 100);
         const sub3 = await ask(
-          `הקול הנוכחי הוא ${currentVoiceObj.spokenName}. ` +
-            'לבחירת קול חדש מרשימת הקולות ושמיעת משפט לדוגמה לפני אישור הקישו 1. ' +
-            'לשינוי מהירות הדיבור הקישו 2. ' +
-            'להפעלה או כיבוי של ניקוד אוטומטי הקישו 3. ' +
+          `הקול הנוכחי הוא ${currentVoiceObj.spokenName}, מהירות דיבור ${ratePct} אחוז, ניקוד אוטומטי ${cfg.useNikud ? 'פעיל' : 'כבוי'}. ` +
+            'לבחירת קול חדש לפי קטגוריות ושמיעת דוגמה של כל קול לפני אישור הקישו 1. ' +
+            'לסיור קולי רציף ושמיעת כל 28 הקולות אחד אחרי השני הקישו 2. ' +
+            'לשמיעת דוגמה של הקול הנוכחי הקישו 3. ' +
+            'לשינוי מהירות הדיבור הקישו 4. ' +
+            'להפעלה או כיבוי של ניקוד אוטומטי הקישו 5. ' +
             'לחזרה הקישו 9'
         );
         if (sub3 === '1') {
           let voiceSaved = false;
           while (!voiceSaved) {
             const groupChoice = await ask(
-              'בחרו קטגוריית קולות: ' +
-                'לקולות גברים מקצועיים של גוגל סטודיו קבוצה א — עמוקים סמכותיים ועסקיים הקישו 1. ' +
-                'לקולות גברים נוספים של גוגל סטודיו קבוצה ב — לבביים שיחתיים וקרייניים הקישו 2. ' +
-                'לקולות נשים מקצועיים של גוגל סטודיו הקישו 3. ' +
-                'לקולות קלאסיים ווייבנט גברים ונשים הקישו 4. ' +
+              'בחרו קטגוריית קולות לשמיעה: ' +
+                'לקולות גברים אנושיים של גוגל סטודיו קבוצה א — עמוקים סמכותיים ועסקיים הקישו 1. ' +
+                'לקולות גברים אנושיים של גוגל סטודיו קבוצה ב — לבביים שיחתיים וקרייניים הקישו 2. ' +
+                'לקולות נשים אנושיים של גוגל סטודיו הקישו 3. ' +
+                'לקולות קלאסיים גברים ונשים הקישו 4. ' +
                 'לחזרה הקישו 9'
             );
             if (!groupChoice || groupChoice === '9' || groupChoice.toLowerCase().includes('hangup')) {
@@ -4532,7 +5006,7 @@ async function startServer() {
 
             while (!voiceSaved) {
               const listPrompt =
-                'בחרו קול לשמיעת משפט לדוגמה: ' +
+                'בחרו קול לשמיעת משפט לדוגמה לפני אישור: ' +
                 pool
                   .slice(0, 8)
                   .map((v, i) => `לקול ${v.spokenName} הקישו ${i + 1}`)
@@ -4542,92 +5016,77 @@ async function startServer() {
               if (!r || r === '9' || r.toLowerCase().includes('hangup')) {
                 break;
               }
-              const picked = pool[Number(r) - 1];
-              if (!picked) {
+              let idx = Number(r) - 1;
+              if (isNaN(idx) || idx < 0 || idx >= pool.length) {
                 await notice('בחירה לא תקינה, נסו שוב');
                 continue;
               }
 
-              // Synthesize & play a live sample sentence in the candidate voice before confirming!
-              const sampleSentence =
-                'שלום וברכה! כך הקול שלי נשמע בשיחת הטלפון במערכת ימות איי איי. אם הקול הזה נעים ומתאים לכם, אשמח לענות למתקשרים שלכם בקול הזה.';
-              const rate = cfg.voice?.speakingRate ?? 1.0;
-              let previewPath = '';
-              try {
-                const sampleHash = getTtsHash(sampleSentence, picked.name, rate);
-                previewPath = `/ApiAudio/prev_${sampleHash}`;
-                const sysNum = yemotToken.split(':')[0];
-                const prevKey = `${sysNum}:${previewPath}`;
-                if (!uploadedGreetingsOnYemot.has(prevKey)) {
-                  const sampleAudio = await synthesizeSpeechAudio(sampleSentence, picked.name, rate);
-                  await uploadAudioToYemot(
-                    yemotToken,
-                    sampleAudio.buf,
-                    sampleAudio.mime,
-                    `${previewPath}.wav`
-                  );
-                  markFileUploadedOnYemot(prevKey);
-                }
-              } catch (e) {
-                console.warn('Voice preview upload warning:', (e as Error)?.message || e);
-                previewPath = '';
-              }
-
-              let keepPreviewingThisVoice = true;
-              while (keepPreviewingThisVoice) {
-                const confirmInstructionMsgs = await toCachedAdminMessages(
-                  yemotToken,
-                  previewPath
-                    ? `שמעתם כעת דוגמה של הקול ${picked.spokenName}. לאישור ושמירת הקול הזה הקישו 1. לשמיעת המשפט לדוגמה פעם נוספת הקישו 2. לבחירת קול אחר מהרשימה הקישו 3`
-                    : `נבחר הקול ${picked.spokenName}. לאישור ושמירת הקול הזה הקישו 1. לבחירת קול אחר מהרשימה הקישו 3`
-                );
-                const confirmPrompt: YemotMessage[] = previewPath
-                  ? [{ type: 'file', data: previewPath }, ...confirmInstructionMsgs]
-                  : confirmInstructionMsgs;
-
-                const confirmTap = await call.read(confirmPrompt, 'tap', {
-                  max_digits: 1,
-                  min_digits: 1,
-                  sec_wait: 9,
-                });
-
-                if (confirmTap === '1') {
-                  cfg.voice = {
-                    provider: 'google',
-                    name: picked.name,
-                    speakingRate: rate,
-                  };
-                  await saveAndSyncExt(
-                    cfg,
-                    `הקול אושר ועודכן בהצלחה ל${picked.spokenName} ויישמר קבוע בכל השיחות`,
-                    true
-                  );
+              while (idx >= 0 && idx < pool.length && !voiceSaved) {
+                const outcome = await previewAndConfirmVoice(pool[idx], pool, idx);
+                if (outcome === 'saved') {
                   voiceSaved = true;
-                  keepPreviewingThisVoice = false;
-                } else if (confirmTap === '2' && previewPath) {
-                  // Loop again to replay the voice sample
-                  continue;
+                  break;
+                } else if (outcome === 'next') {
+                  idx = (idx + 1) % pool.length;
                 } else {
-                  // Go back to the numbered voice list
-                  keepPreviewingThisVoice = false;
+                  break;
                 }
               }
             }
           }
         } else if (sub3 === '2') {
+          let idx = 0;
+          while (idx < VOICES.length) {
+            const outcome = await previewAndConfirmVoice(VOICES[idx], VOICES, idx);
+            if (outcome === 'saved' || outcome === 'back') {
+              break;
+            }
+            idx = (idx + 1) % VOICES.length;
+          }
+        } else if (sub3 === '3') {
+          await previewAndConfirmVoice(currentVoiceObj, VOICES, Math.max(0, VOICES.indexOf(currentVoiceObj)));
+        } else if (sub3 === '4') {
           const rateChoice = await ask(
-            'לדיבור איטי הקישו 1. לדיבור רגיל הקישו 2. לדיבור מהיר הקישו 3. לדיבור מהיר מאוד הקישו 4.'
+            `מהירות הדיבור הנוכחית היא ${ratePct} אחוז. ` +
+              'לדיבור איטי רגוע 80 אחוז הקישו 1. ' +
+              'לדיבור מתון 90 אחוז הקישו 2. ' +
+              'לדיבור טבעי רגיל 100 אחוז הקישו 3. ' +
+              'לדיבור זריז 110 אחוז הקישו 4. ' +
+              'לדיבור מהיר 120 אחוז הקישו 5. ' +
+              'לדיבור מהיר מאוד 130 אחוז הקישו 6. ' +
+              'להקשת אחוז מהירות מדויק בין 70 ל 130 הקישו 7. ' +
+              'לחזרה הקישו 9'
           );
-          const rates: Record<string, number> = { '1': 0.85, '2': 1.0, '3': 1.15, '4': 1.3 };
-          if (rates[rateChoice]) {
+          const presetRates: Record<string, number> = {
+            '1': 0.8,
+            '2': 0.9,
+            '3': 1.0,
+            '4': 1.1,
+            '5': 1.2,
+            '6': 1.3,
+          };
+          let newRate = presetRates[rateChoice];
+          if (rateChoice === '7') {
+            const customPct = await ask('הקישו אחוז מהירות דיבור בין 70 ל 130 ובסיום סולמית', 3);
+            const parsedPct = Number(customPct);
+            if (parsedPct >= 70 && parsedPct <= 130) {
+              newRate = Number((parsedPct / 100).toFixed(2));
+            }
+          }
+          if (newRate) {
             cfg.voice = {
               provider: 'google',
               name: cfg.voice?.name || 'he-IL-Chirp3-HD-Charon',
-              speakingRate: rates[rateChoice],
+              speakingRate: newRate,
             };
-            await saveAndSyncExt(cfg, 'מהירות הדיבור עודכנה', true);
+            await saveAndSyncExt(
+              cfg,
+              `מהירות הדיבור עודכנה ל ${Math.round(newRate * 100)} אחוז`,
+              true
+            );
           }
-        } else if (sub3 === '3') {
+        } else if (sub3 === '5') {
           cfg.useNikud = !cfg.useNikud;
           await saveAndSyncExt(cfg, cfg.useNikud ? 'ניקוד אוטומטי הופעל' : 'ניקוד אוטומטי כובה');
         }
@@ -4637,8 +5096,11 @@ async function startServer() {
       // 4. Speaking style
       if (mainChoice === '4') {
         const keys = Object.keys(STYLES);
+        const currentStyleHe = STYLE_NAMES_HE[cfg.style] || cfg.style;
         const r = await ask(
-          keys.map((k, i) => `לסגנון ${STYLE_NAMES_HE[k] || k} הקישו ${i + 1}`).join('. ')
+          `סגנון הדיבור הנוכחי הוא ${currentStyleHe}. ` +
+            keys.map((k, i) => `לסגנון ${STYLE_NAMES_HE[k] || k} הקישו ${i + 1}`).join('. ') +
+            '. לחזרה הקישו 9'
         );
         const picked = keys[Number(r) - 1];
         if (picked) {
@@ -4648,7 +5110,7 @@ async function startServer() {
         continue;
       }
 
-      // 5. System messages (Greeting, Goodbye, Consent, Closed, Denied, Off-topic)
+      // 5. System messages (Greeting, Goodbye, Consent, Closed, Denied, Off-topic) + Hear all messages
       if (mainChoice === '5') {
         const sub5 = await ask(
           'לעדכון הודעת פתיחה הקישו 1. ' +
@@ -4657,7 +5119,8 @@ async function startServer() {
             'לעדכון הודעה כשהשירות סגור הקישו 4. ' +
             'לעדכון הודעה למספר חסום הקישו 5. ' +
             'לעדכון תשובה לנושא לא מורשה הקישו 6. ' +
-            'למחיקת הודעת ההסכמה הקישו 7. לחזרה הקישו 9'
+            'למחיקת הודעת ההסכמה הקישו 7. ' +
+            'לשמיעת כל הודעות המערכת המוגדרות כעת הקישו 8. לחזרה הקישו 9'
         );
         if (sub5 === '1') {
           const t = await recordAndTranscribeAdminInput(
@@ -4669,7 +5132,7 @@ async function startServer() {
           );
           if (t) {
             cfg.greeting = t;
-            await saveAndSyncExt(cfg, 'הודעת הפתיחה עודכנה');
+            await saveAndSyncExt(cfg, `הודעת הפתיחה עודכנה ל: ${t}`);
           }
         } else if (sub5 === '2') {
           const t = await recordAndTranscribeAdminInput(
@@ -4681,7 +5144,7 @@ async function startServer() {
           );
           if (t) {
             cfg.goodbye = t;
-            await saveAndSyncExt(cfg, 'הודעת הסיום עודכנה');
+            await saveAndSyncExt(cfg, `הודעת הסיום עודכנה ל: ${t}`);
           }
         } else if (sub5 === '3') {
           const t = await recordAndTranscribeAdminInput(
@@ -4693,7 +5156,7 @@ async function startServer() {
           );
           if (t) {
             cfg.consentMessage = t;
-            await saveAndSyncExt(cfg, 'הודעת ההסכמה עודכנה');
+            await saveAndSyncExt(cfg, `הודעת ההסכמה עודכנה ל: ${t}`);
           }
         } else if (sub5 === '4') {
           const t = await recordAndTranscribeAdminInput(
@@ -4705,7 +5168,7 @@ async function startServer() {
           );
           if (t) {
             cfg.closedMessage = t;
-            await saveAndSyncExt(cfg, 'הודעת הסגירה עודכנה');
+            await saveAndSyncExt(cfg, `הודעת הסגירה עודכנה ל: ${t}`);
           }
         } else if (sub5 === '5') {
           const t = await recordAndTranscribeAdminInput(
@@ -4717,7 +5180,7 @@ async function startServer() {
           );
           if (t) {
             cfg.deniedMessage = t;
-            await saveAndSyncExt(cfg, 'הודעת החסימה עודכנה');
+            await saveAndSyncExt(cfg, `הודעת החסימה עודכנה ל: ${t}`);
           }
         } else if (sub5 === '6') {
           const t = await recordAndTranscribeAdminInput(
@@ -4729,22 +5192,41 @@ async function startServer() {
           );
           if (t) {
             cfg.offTopicReply = t;
-            await saveAndSyncExt(cfg, 'התשובה לנושא לא מורשה עודכנה');
+            await saveAndSyncExt(cfg, `התשובה לנושא לא מורשה עודכנה ל: ${t}`);
           }
         } else if (sub5 === '7') {
           cfg.consentMessage = '';
           await saveAndSyncExt(cfg, 'הודעת ההסכמה הוסרה');
+        } else if (sub5 === '8') {
+          await notice(
+            `הודעת פתיחה: ${cfg.greeting || 'לא הוגדרה'}. ` +
+              `הודעת סיום: ${cfg.goodbye || 'לא הוגדרה'}. ` +
+              `הודעת הסכמה: ${cfg.consentMessage || 'ללא הודעת הסכמה'}. ` +
+              `הודעת סגירה: ${cfg.closedMessage || 'לא הוגדרה'}. ` +
+              `הודעת חסימה: ${cfg.deniedMessage || 'לא הוגדרה'}. ` +
+              `תשובה לנושא לא מורשה: ${cfg.offTopicReply || 'לא הוגדרה'}.`
+          );
         }
         continue;
       }
 
       // 6. Topics restrictions
       if (mainChoice === '6') {
+        const modeHe =
+          cfg.topicsMode === 'allowed'
+            ? 'רק נושאים מותרים'
+            : cfg.topicsMode === 'blocked'
+            ? 'חסימת נושאים'
+            : 'כל הנושאים מותרים';
         const sub6 = await ask(
-          'למצב כל הנושאים מותרים הקישו 1. ' +
+          `מצב הנושאים הנוכחי: ${modeHe}. ` +
+            'למצב כל הנושאים מותרים הקישו 1. ' +
             'למצב רק נושאים מותרים הקישו 2. ' +
             'למצב חסימת נושאים הקישו 3. ' +
-            'להקלטת רשימת הנושאים הקישו 4. לחזרה הקישו 9'
+            'להחלפת כל רשימת הנושאים בקול הקישו 4. ' +
+            'להוספת נושא נוסף לרשימה הקישו 5. ' +
+            'לניקוי רשימת הנושאים הקישו 6. ' +
+            'לשמיעת רשימת הנושאים הנוכחית הקישו 7. לחזרה הקישו 9'
         );
         if (sub6 === '1') {
           cfg.topicsMode = 'all';
@@ -4765,26 +5247,54 @@ async function startServer() {
           );
           if (t) {
             cfg.topics = t
-              .split(/[,. ו]+/)
+              .split(/[,.]+/)
               .map((s) => s.trim())
               .filter(Boolean);
-            await saveAndSyncExt(cfg, 'רשימת הנושאים עודכנה');
+            await saveAndSyncExt(cfg, `רשימת הנושאים עודכנה: ${cfg.topics.join(', ')}`);
           }
+        } else if (sub6 === '5') {
+          const t = await recordAndTranscribeAdminInput(
+            call,
+            yemotToken,
+            'אמרו את הנושא שברצונכם להוסיף לרשימה.',
+            callId,
+            ++stepIdx
+          );
+          if (t) {
+            cfg.topics = Array.from(new Set([...(cfg.topics || []), t.trim()]));
+            await saveAndSyncExt(cfg, `הנושא ${t} נוסף לרשימה`);
+          }
+        } else if (sub6 === '6') {
+          cfg.topics = [];
+          await saveAndSyncExt(cfg, 'רשימת הנושאים נוקתה');
+        } else if (sub6 === '7') {
+          const listStr = (cfg.topics || []).length
+            ? cfg.topics.join(', ')
+            : 'אין נושאים ברשימה';
+          await notice(`מצב הנושאים: ${modeHe}. הנושאים ברשימה: ${listStr}`);
         }
         continue;
       }
 
       // 7. Caller access control (Whitelist / Blacklist)
       if (mainChoice === '7') {
+        if (!cfg.access) cfg.access = { mode: 'all', numbers: [] };
+        const accessModeHe =
+          cfg.access.mode === 'whitelist'
+            ? 'רשימה לבנה בלבד'
+            : cfg.access.mode === 'blacklist'
+            ? 'רשימה שחורה'
+            : 'פתוח לכל המספרים';
         const sub7 = await ask(
-          'לפתיחת השלוחה לכל המספרים הקישו 1. ' +
+          `בקרת גישה כעת: ${accessModeHe}, וברשימה ${(cfg.access.numbers || []).length} מספרים. ` +
+            'לפתיחת השלוחה לכל המספרים הקישו 1. ' +
             'למצב רשימה לבנה בלבד הקישו 2. ' +
             'למצב רשימה שחורה הקישו 3. ' +
             'להוספת מספר טלפון לרשימה הקישו 4. ' +
             'להסרת מספר טלפון מהרשימה הקישו 5. ' +
-            'לניקוי כל המספרים מהרשימה הקישו 6. לחזרה הקישו 9'
+            'לניקוי כל המספרים מהרשימה הקישו 6. ' +
+            'לשמיעת כל המספרים המופיעים ברשימה הקישו 7. לחזרה הקישו 9'
         );
-        if (!cfg.access) cfg.access = { mode: 'all', numbers: [] };
         if (sub7 === '1') {
           cfg.access.mode = 'all';
           await saveAndSyncExt(cfg, 'השלוחה פתוחה כעת לכל המספרים');
@@ -4809,11 +5319,18 @@ async function startServer() {
         } else if (sub7 === '6') {
           cfg.access.numbers = [];
           await saveAndSyncExt(cfg, 'הרשימה נוקתה');
+        } else if (sub7 === '7') {
+          const nums = cfg.access.numbers || [];
+          await notice(
+            nums.length
+              ? `המספרים ברשימה הם: ${nums.map((n) => n.split('').join(' ')).join(', ')}`
+              : 'הרשימה ריקה כעת'
+          );
         }
         continue;
       }
 
-      // 8. Schedule, max call duration, hands-free conversation mode, and tools
+      // 8. Weekly schedule (per-day hours editor), max call duration, hands-free mode, smart tools, sender email & autoSync
       if (mainChoice === '8') {
         const hfStatus =
           cfg.handsFreeMode !== false
@@ -4821,18 +5338,112 @@ async function startServer() {
             : 'כבוי, סיום דיבור בלחיצה על סולמית';
         const sub8 = await ask(
           `מצב שיחה טבעית כעת: ${hfStatus}. ` +
-            'להפעלה או כיבוי של הגבלת שעות פעילות הקישו 1. ' +
+            'לניהול שעות פעילות ולוח ימים שבועי הקישו 1. ' +
             'להגדרת אורך שיחה מקסימלי בדקות הקישו 2. ' +
-            'להפעלה או כיבוי של שליחת מייל הקישו 3. ' +
-            'להפעלה או כיבוי של יצירת תמונות הקישו 4. ' +
-            'להגדרת מצב שיחה טבעית רציפה ללא צורך בלחיצה על סולמית הקישו 5. לחזרה הקישו 9'
+            `ל${cfg.tools?.email !== false ? 'כיבוי' : 'הפעלת'} כלי שליחת מייל תוך כדי שיחה הקישו 3. ` +
+            `ל${cfg.tools?.images !== false ? 'כיבוי' : 'הפעלת'} כלי יצירת תמונות ושליחתן למייל הקישו 4. ` +
+            'להגדרת מצב שיחה טבעית רציפה ללא סולמית הקישו 5. ' +
+            'לעדכון כתובת האימייל השולח של המערכת הקישו 6. ' +
+            `ל${cfg.autoSyncYemot !== false ? 'כיבוי' : 'הפעלת'} סנכרון שלוחות אוטומטי מול ימות המשיח הקישו 7. ` +
+            'לחזרה הקישו 9'
         );
         if (sub8 === '1') {
-          cfg.schedule = { ...(cfg.schedule || { tz: 'Asia/Jerusalem', days: DEFAULT_DAYS }), enabled: !cfg.schedule?.enabled };
-          await saveAndSyncExt(
-            cfg,
-            cfg.schedule.enabled ? 'הגבלת שעות פעילות הופעלה' : 'הגבלת שעות פעילות כובתה'
+          if (!cfg.schedule) {
+            cfg.schedule = { enabled: false, tz: 'Asia/Jerusalem', days: [...DEFAULT_DAYS] };
+          }
+          if (!Array.isArray(cfg.schedule.days) || cfg.schedule.days.length < 7) {
+            cfg.schedule.days = [...DEFAULT_DAYS];
+          }
+          const dayNamesHe = ['ראשון', 'שני', 'שלישי', 'רביעי', 'חמישי', 'שישי', 'שבת'];
+          const schedAction = await ask(
+            `הגבלת שעות פעילות כעת ${cfg.schedule.enabled ? 'פעילה' : 'כבויה'}. ` +
+              `ל${cfg.schedule.enabled ? 'כיבוי' : 'הפעלת'} הגבלת שעות הפעילות הקישו 1. ` +
+              'לעריכת שעות פתיחה וסגירה של יום מסוים בשבוע הקישו 2. ' +
+              'להגדרת שעות אחידות לכל ימי החול ראשון עד חמישי הקישו 3. ' +
+              'לשמיעת לוח שעות הפעילות המלא הקישו 4. לחזרה הקישו 9'
           );
+          if (schedAction === '1') {
+            cfg.schedule.enabled = !cfg.schedule.enabled;
+            await saveAndSyncExt(
+              cfg,
+              cfg.schedule.enabled ? 'הגבלת שעות פעילות הופעלה' : 'הגבלת שעות פעילות כובתה'
+            );
+          } else if (schedAction === '2') {
+            const dayPick = await ask(
+              'בחרו יום לעריכה: ליום ראשון הקישו 1. לשני 2. לשלישי 3. לרביעי 4. לחמישי 5. לשישי 6. לשבת 7.'
+            );
+            const dayIdx = Number(dayPick) - 1;
+            if (dayIdx >= 0 && dayIdx <= 6) {
+              const curDay = cfg.schedule.days[dayIdx] || { open: true, from: '09:00', to: '18:00' };
+              const dayMode = await ask(
+                `יום ${dayNamesHe[dayIdx]} כעת ${curDay.open ? `פתוח מ ${curDay.from} עד ${curDay.to}` : 'סגור'}. ` +
+                  'לפתיחת היום והגדרת שעות פתיחה וסגירה הקישו 1. ' +
+                  'לסגירת השירות ביום זה הקישו 2. לחזרה הקישו 9'
+              );
+              if (dayMode === '1') {
+                const startRaw = await ask(
+                  'הקישו שעת פתיחה ב 4 ספרות, למשל 0800 לשמונה בבוקר, ובסיום סולמית',
+                  4
+                );
+                const endRaw = await ask(
+                  'הקישו שעת סגירה ב 4 ספרות, למשל 2200 לעשר בלילה, ובסיום סולמית',
+                  4
+                );
+                const sDigits = String(startRaw || '').replace(/\D/g, '').padStart(4, '0');
+                const eDigits = String(endRaw || '').replace(/\D/g, '').padStart(4, '0');
+                const startFormatted = `${sDigits.slice(0, 2)}:${sDigits.slice(2, 4)}`;
+                const endFormatted = `${eDigits.slice(0, 2)}:${eDigits.slice(2, 4)}`;
+                cfg.schedule.days[dayIdx] = {
+                  open: true,
+                  from: startFormatted,
+                  to: endFormatted,
+                };
+                cfg.schedule.enabled = true;
+                await saveAndSyncExt(
+                  cfg,
+                  `יום ${dayNamesHe[dayIdx]} הוגדר פתוח מ ${startFormatted} עד ${endFormatted}`
+                );
+              } else if (dayMode === '2') {
+                cfg.schedule.days[dayIdx] = { ...curDay, open: false };
+                cfg.schedule.enabled = true;
+                await saveAndSyncExt(cfg, `יום ${dayNamesHe[dayIdx]} הוגדר סגור`);
+              }
+            }
+          } else if (schedAction === '3') {
+            const startRaw = await ask(
+              'הקישו שעת פתיחה לימים ראשון עד חמישי ב 4 ספרות, למשל 0800, ובסיום סולמית',
+              4
+            );
+            const endRaw = await ask(
+              'הקישו שעת סגירה לימים ראשון עד חמישי ב 4 ספרות, למשל 2200, ובסיום סולמית',
+              4
+            );
+            const sDigits = String(startRaw || '').replace(/\D/g, '').padStart(4, '0');
+            const eDigits = String(endRaw || '').replace(/\D/g, '').padStart(4, '0');
+            const startFormatted = `${sDigits.slice(0, 2)}:${sDigits.slice(2, 4)}`;
+            const endFormatted = `${eDigits.slice(0, 2)}:${eDigits.slice(2, 4)}`;
+            for (let d = 0; d <= 4; d++) {
+              cfg.schedule.days[d] = {
+                open: true,
+                from: startFormatted,
+                to: endFormatted,
+              };
+            }
+            cfg.schedule.enabled = true;
+            await saveAndSyncExt(
+              cfg,
+              `ימים ראשון עד חמישי הוגדרו פתוחים מ ${startFormatted} עד ${endFormatted}`
+            );
+          } else if (schedAction === '4') {
+            const summaryParts = dayNamesHe.map((dName, idx) => {
+              const dObj = cfg.schedule?.days?.[idx];
+              if (!dObj || !dObj.open) return `יום ${dName} סגור`;
+              return `יום ${dName} מ ${dObj.from} עד ${dObj.to}`;
+            });
+            await notice(
+              `לוח שעות פעילות (${cfg.schedule.enabled ? 'פעיל' : 'כבוי'}): ${summaryParts.join('. ')}`
+            );
+          }
         } else if (sub8 === '2') {
           const mins = await ask('הקישו אורך שיחה מקסימלי בדקות מ 1 עד 60 ובסיום סולמית', 2);
           const parsed = Number(mins);
@@ -4869,30 +5480,57 @@ async function startServer() {
             cfg.handsFreeMode = false;
             await saveAndSyncExt(cfg, 'הופעל מצב סיום דיבור בלחיצה על סולמית');
           }
+        } else if (sub8 === '6') {
+          const em = await askEmailOrVoice('כתובת האימייל השולח של המערכת');
+          if (em === '__CLEAR__') {
+            tenant.mailFrom = '';
+            tenants[tenant.id] = tenant;
+            saveLocalTenants(tenants);
+            await persistTenantToYemotCloud(tenant);
+            await notice('כתובת האימייל השולח אופסה לברירת המחדל');
+          } else if (em) {
+            tenant.mailFrom = em;
+            tenants[tenant.id] = tenant;
+            saveLocalTenants(tenants);
+            await persistTenantToYemotCloud(tenant);
+            await notice(`כתובת האימייל השולח עודכנה ל ${em}`);
+          }
+        } else if (sub8 === '7') {
+          cfg.autoSyncYemot = cfg.autoSyncYemot === false;
+          await saveAndSyncExt(
+            cfg,
+            cfg.autoSyncYemot
+              ? 'סנכרון שלוחות אוטומטי מול ימות המשיח הופעל'
+              : 'סנכרון שלוחות אוטומטי מול ימות המשיח כובה'
+          );
         }
         continue;
       }
 
-      // 9. Memory management, stats, and multi-extension switching / creation
+      // 9. Multi-extension management, memory management, daily limit, and Yemot re-sync
       if (mainChoice === '9') {
         const extList = Object.keys(tenant.extensions || { [activeExtKey]: cfg });
         const callerCount = Object.keys(
           tenant.extensionMemories?.[activeExtKey] || tenant.memory || {}
         ).length;
         const sub9 = await ask(
-          `בשלוחה זו שמורים ${callerCount} מתקשרים בזיכרון, והיום בוצעו ${tenant.callsToday || 0} שיחות. ` +
-            `במערכת מוגדרות ${extList.length} שלוחות צאט. ` +
-            'למעבר לניהול שלוחת צאט אחרת או פתיחת שלוחה חדשה הקישו 1. ' +
+          `אתם מנהלים כעת את שלוחה ${extDisplay}. בשלוחה זו שמורים ${callerCount} מתקשרים בזיכרון, והיום בוצעו ${tenant.callsToday || 0} שיחות מתוך ${tenant.dailyCallLimit || 300}. ` +
+            `במערכת מוגדרות ${extList.length} שלוחות צאט: ${extList.join(', ')}. ` +
+            'למעבר לניהול שלוחת צאט אחרת או הוספת שלוחת צאט חדשה הקישו 1. ' +
             'למחיקת זיכרון שיחות של מספר טלפון מסוים הקישו 2. ' +
             'לאיפוס כל זיכרון השיחות בשלוחה זו הקישו 3. ' +
-            'לשינוי מגבלת השיחות היומית הקישו 4. לחזרה הקישו 9'
+            'לשינוי מגבלת השיחות היומית הקישו 4. ' +
+            'למחיקת שלוחת צאט משנית הקישו 5. ' +
+            'לשינוי מספר שלוחת הניהול הטלפונית הקישו 6. ' +
+            'לביצוע סנכרון מלא של כל השלוחות מול ימות המשיח כעת הקישו 7. ' +
+            'לחזרה הקישו 9'
         );
         if (sub9 === '1') {
           const newExt = await ask(
-            'הקישו את מספר השלוחה שברצונכם לנהל או להגדיר כבוט צאט חדש, למשל 1 או 2 או 4, ובסיום סולמית',
+            'הקישו את מספר השלוחה שברצונכם לנהל או להגדיר כבוט צאט חדש, למשל 1 או 3 או 4, או 0 לשלוחה הראשית, ובסיום סולמית',
             4
           );
-          const cleaned = normalizeExtKey(newExt);
+          const cleaned = newExt === '0' ? 'root' : normalizeExtKey(newExt);
           if (cleaned) {
             activeExtKey = cleaned;
             if (!tenant.extensions?.[activeExtKey]) {
@@ -4900,9 +5538,9 @@ async function startServer() {
                 ...cfg,
                 yemotChatExt: activeExtKey,
               });
-              await saveAndSyncExt(freshCfg, `שלוחה ${activeExtKey} נוצרה והוגדרה כשלוחת צאט חדשה`);
+              await saveAndSyncExt(freshCfg, `שלוחה ${activeExtKey === 'root' ? 'הראשית' : activeExtKey} נוצרה והוגדרה כשלוחת צאט חדשה`);
             } else {
-              await notice(`עברתם לניהול שלוחה ${activeExtKey}`);
+              await notice(`עברתם לניהול שלוחה ${activeExtKey === 'root' ? 'הראשית' : activeExtKey}`);
             }
           }
         } else if (sub9 === '2') {
@@ -4921,6 +5559,7 @@ async function startServer() {
             ).catch(() => {});
             tenants[tenant.id] = tenant;
             saveLocalTenants(tenants);
+            await persistTenantToYemotCloud(tenant);
             await notice('זיכרון השיחות של המספר נמחק');
           }
         } else if (sub9 === '3') {
@@ -4930,6 +5569,7 @@ async function startServer() {
           tenant.memory = {};
           tenants[tenant.id] = tenant;
           saveLocalTenants(tenants);
+          await persistTenantToYemotCloud(tenant);
           await notice('כל זיכרון השיחות בשלוחה זו אופס בהצלחה');
         } else if (sub9 === '4') {
           const lim = await ask('הקישו מגבלת שיחות יומית חדשה ובסיום סולמית', 4);
@@ -4938,9 +5578,64 @@ async function startServer() {
             tenant.dailyCallLimit = parsedLim;
             tenants[tenant.id] = tenant;
             saveLocalTenants(tenants);
-            persistTenantToYemotCloud(tenant).catch(() => {});
+            await persistTenantToYemotCloud(tenant);
             await notice(`מגבלת השיחות היומית עודכנה ל ${parsedLim} שיחות`);
           }
+        } else if (sub9 === '5') {
+          if (extList.length <= 1) {
+            await notice('לא ניתן למחוק את שלוחת הצאט היחידה במערכת');
+          } else {
+            const extToDel = await ask(
+              `הקישו את מספר השלוחה שברצונכם למחוק מתוך ${extList.join(', ')} ובסיום סולמית`,
+              4
+            );
+            const cleanedDel = normalizeExtKey(extToDel);
+            if (cleanedDel && tenant.extensions?.[cleanedDel] && extList.length > 1) {
+              delete tenant.extensions[cleanedDel];
+              if (activeExtKey === cleanedDel) {
+                activeExtKey = Object.keys(tenant.extensions)[0] || '1';
+              }
+              tenants[tenant.id] = tenant;
+              saveLocalTenants(tenants);
+              await persistTenantToYemotCloud(tenant);
+              await notice(`שלוחה ${cleanedDel} הוסרה מרשימת שלוחות הבוט`);
+            }
+          }
+        } else if (sub9 === '6') {
+          const newAdminExt = await ask(
+            `שלוחת הניהול הנוכחית היא ${tenant.yemotAdminExt || '2'}. הקישו מספר שלוחה חדש לשלוחת הניהול ובסיום סולמית`,
+            4
+          );
+          const cleanedAdm = normalizeExtKey(newAdminExt);
+          if (cleanedAdm && cleanedAdm !== 'root') {
+            tenant.yemotAdminExt = cleanedAdm;
+            cfg.yemotAdminExt = cleanedAdm;
+            await saveAndSyncExt(cfg, `שלוחת הניהול הטלפונית הועברה לשלוחה ${cleanedAdm}`);
+          }
+        } else if (sub9 === '7') {
+          const publicOrigin = getPublicOrigin(call.req);
+          const chatApiLink = `${publicOrigin}/chat/${tenant.id}`;
+          for (const [eKey, eCfg] of Object.entries(tenant.extensions || { [activeExtKey]: cfg })) {
+            await configureYemotExtensionFull(
+              yemotNum,
+              yemotPass,
+              eKey === 'root' ? 'root' : eKey,
+              chatApiLink,
+              eCfg,
+              false
+            );
+          }
+          if (tenant.yemotAdminExt) {
+            await configureYemotExtensionFull(
+              yemotNum,
+              yemotPass,
+              tenant.yemotAdminExt,
+              `${publicOrigin}/admin/${tenant.id}`,
+              cfg,
+              true
+            );
+          }
+          await notice('כל שלוחות הצאט ושלוחת הניהול סונכרנו בהצלחה מול ימות המשיח');
         }
         continue;
       }
@@ -4989,8 +5684,8 @@ async function startServer() {
       ext: k === 'root' ? 'main' : k,
       role: v.role,
       roleLabel: PRESETS[v.role]?.label || v.role,
-      voice: v.voice?.name || 'he-IL-Wavenet-A',
-      voiceName: v.voice?.name || 'he-IL-Wavenet-A',
+      voice: v.voice?.name || 'he-IL-Chirp3-HD-Aoede',
+      voiceName: v.voice?.name || 'he-IL-Chirp3-HD-Aoede',
       businessName: v.businessName || '',
       greeting: v.greeting || '',
       enabled: v.enabled,
@@ -5108,7 +5803,7 @@ async function startServer() {
       tenant.yemotSyncedAt = new Date().toISOString();
       tenants[tenant.id] = tenant;
       saveLocalTenants(tenants);
-      persistTenantToYemotCloud(tenant).catch(() => {});
+      await persistTenantToYemotCloud(tenant);
       syncTenantToDeployedCloudRun(tenant.id, yemotPass, currentCfg, extKey).catch(() => {});
 
       const extLabel =
@@ -5141,7 +5836,7 @@ async function startServer() {
       tenant.config = getTenantExtConfig(tenant, nextActive);
       tenants[tenant.id] = tenant;
       saveLocalTenants(tenants);
-      persistTenantToYemotCloud(tenant).catch(() => {});
+      await persistTenantToYemotCloud(tenant);
       res.json({
         ok: true,
         activeExt: nextActive === 'root' ? 'main' : nextActive,
@@ -5236,7 +5931,7 @@ async function startServer() {
 
       tenants[tenant.id] = tenant;
       saveLocalTenants(tenants);
-      persistTenantToYemotCloud(tenant).catch(() => {});
+      await persistTenantToYemotCloud(tenant);
       res.json({
         ...nextConfig,
         yemotSyncMessage,
@@ -5261,7 +5956,7 @@ async function startServer() {
       }
       tenants[tenant.id] = tenant;
       saveLocalTenants(tenants);
-      persistTenantToYemotCloud(tenant).catch(() => {});
+      await persistTenantToYemotCloud(tenant);
       res.json({ ok: true });
       return;
     }
@@ -5328,7 +6023,7 @@ async function startServer() {
       }
       tenants[tenant.id] = tenant;
       saveLocalTenants(tenants);
-      persistTenantToYemotCloud(tenant).catch(() => {});
+      await persistTenantToYemotCloud(tenant);
       res.json({ ok: true, clearedCount });
       return;
     }
@@ -5371,8 +6066,8 @@ async function startServer() {
           roleLabel: PRESETS[cfg.role]?.label || cfg.role,
           style: cfg.style,
           styleLabel: STYLE_NAMES_HE[cfg.style] || cfg.style,
-          voiceName: cfg.voice?.name || 'he-IL-Wavenet-A',
-          voiceLabel: voiceObj?.label || cfg.voice?.name || 'he-IL-Wavenet-A',
+          voiceName: cfg.voice?.name || 'he-IL-Chirp3-HD-Aoede',
+          voiceLabel: voiceObj?.label || cfg.voice?.name || 'he-IL-Chirp3-HD-Aoede',
           speakingRate: cfg.voice?.speakingRate ?? 1.0,
           useNikud: Boolean(cfg.useNikud),
           handsFreeMode: cfg.handsFreeMode !== false,
@@ -5455,6 +6150,7 @@ async function startServer() {
   app.get('/api/version', (_req, res) => {
     res.json({
       version: CURRENT_SERVER_VERSION,
+      build: APP_BUILD_LABEL,
       tunnelOrigin: activeTunnelOrigin || null,
       publicOrigin: getPublicOrigin(),
       deployedCloudRunIsV8,
@@ -5556,6 +6252,7 @@ self.addEventListener('fetch', (event) => {
             extKey === 'root' ? 'root' : extKey,
             `${origin}/c`,
             extCfg,
+            false,
             false
           );
           await syncTenantToDeployedCloudRun(t.id, t.yemotPassword, extCfg, extKey);
@@ -5571,6 +6268,7 @@ self.addEventListener('fetch', (event) => {
                 extraExt,
                 `${origin}/c`,
                 baseCfg,
+                false,
                 false
               );
             }
@@ -5584,7 +6282,8 @@ self.addEventListener('fetch', (event) => {
             adminExt,
             `${origin}/a`,
             t.config,
-            true
+            true,
+            false
           );
         }
         console.log(`Synced Yemot tenant ${t.id} -> ${origin}/c`);
@@ -5699,9 +6398,6 @@ self.addEventListener('fetch', (event) => {
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server listening on http://0.0.0.0:${PORT} (isProd=${isProd})`);
 
-    firestoreLoadAllTenants().catch((e) =>
-      console.error('FIRESTORE LOAD FAILED:', (e as Error)?.message || e)
-    );
     loadAllTenantsFromCloudRegistry().catch(() => {});
 
     if (isPreviewContainer) {
